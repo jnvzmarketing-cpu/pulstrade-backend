@@ -339,3 +339,43 @@ scanForSignals();
 setInterval(scanForSignals, 5 * 60 * 1000);
 
 app.listen(PORT, () => console.log(`Pulstrade backend on port ${PORT}`));
+
+// ── TradingView Webhook Endpoint ──────────────────────────────────────────────
+app.post('/webhook', express.json(), (req, res) => {
+  try {
+    const data = req.body;
+    console.log('Webhook received:', JSON.stringify(data));
+
+    if (!data.action || !data.price || !data.ticker) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const signal = {
+      ticker:    data.ticker || 'XAU/USD',
+      action:    data.action.toUpperCase(),
+      price:     parseFloat(data.price),
+      sl:        data.sl    ? parseFloat(data.sl)   : null,
+      tp1:       data.tp1   ? parseFloat(data.tp1)  : null,
+      tp2:       data.tp2   ? parseFloat(data.tp2)  : null,
+      timeframe: data.timeframe || null,
+      confidence: data.confidence ? parseInt(data.confidence) : 70,
+      fib_level:  data.fib_level  || null,
+      pattern:    data.pattern    || null,
+      rsi:        data.rsi  ? parseFloat(data.rsi)  : null,
+      atr:        data.atr  ? parseFloat(data.atr)  : null,
+      current_price: parseFloat(data.price),
+      entry_valid_for: data.timeframe === '1H' ? 2 : data.timeframe === '4H' ? 8 : 24,
+      mtf:       JSON.stringify({ h1: data.timeframe === '1', h4: data.timeframe === '4H', d1: data.timeframe === '1D' }),
+      timestamp: Date.now(),
+    };
+
+    db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp)
+      VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)`).run(signal);
+
+    console.log(`✓ Signal saved: ${signal.action} ${signal.ticker} @ ${signal.price}`);
+    res.json({ success: true, signal });
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
