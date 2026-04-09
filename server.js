@@ -280,10 +280,13 @@ app.get('/signals/:id', (req, res) => {
 app.get('/price', async (req, res) => {
   try {
     if (!TWELVE_API_KEY) return res.json({ price: 2318.40, change: 0.74, ticker: TICKER });
-    const url = `https://api.twelvedata.com/price?symbol=${TICKER}&apikey=${TWELVE_API_KEY}`;
+    const symbol = encodeURIComponent(TICKER);
+    const url = `https://api.twelvedata.com/price?symbol=${symbol}&apikey=${TWELVE_API_KEY}`;
     const r = await axios.get(url, { timeout: 5000 });
-    res.json({ price: parseFloat(r.data.price), ticker: TICKER });
-  } catch {
+    const price = parseFloat(r.data.price);
+    res.json({ price, ticker: TICKER });
+  } catch (err) {
+    console.error('Price fetch error:', err.message);
     res.json({ price: 2318.40, ticker: TICKER });
   }
 });
