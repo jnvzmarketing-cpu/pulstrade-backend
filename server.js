@@ -383,12 +383,12 @@ app.post('/webhook', express.json(), (req, res) => {
 app.post('/autotrade/connect-mt5', express.json(), async (req, res) => {
   const { login, password, server, platform, lotSize, autoTradeEnabled } = req.body;
   if (!login || !password || !server) return res.status(400).json({ error: 'Missing credentials' });
-  if (!METAAPI_TOKEN) return res.status(500).json({ error: 'MetaApi not configured' });
+  const METAAPI_TOKEN_LOCAL = process.env.METAAPI_TOKEN || ''; if (!METAAPI_TOKEN_LOCAL) return res.status(500).json({ error: 'MetaApi not configured' });
   try {
     const r = await axios.post(
       'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts',
       { login: login.toString(), password, name: 'Pulstrade_' + login, server, platform: platform || 'mt5', magic: 20240410, application: 'MetaApi', type: 'cloud' },
-      { headers: { 'auth-token': METAAPI_TOKEN, 'Content-Type': 'application/json' }, timeout: 30000 }
+      { headers: { 'auth-token': METAAPI_TOKEN_LOCAL, 'Content-Type': 'application/json' }, timeout: 30000 }
     );
     const accountId = r.data.id;
     db.exec('CREATE TABLE IF NOT EXISTS autotrade_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT UNIQUE NOT NULL, lot_size REAL DEFAULT 0.01, auto_trade INTEGER DEFAULT 1, created_at INTEGER DEFAULT (strftime(\'%s\',\'now\') * 1000))');
@@ -403,9 +403,9 @@ app.post('/autotrade/connect-mt5', express.json(), async (req, res) => {
 app.post('/autotrade/connect-mt5', express.json(), async (req, res) => {
   const { login, password, server, platform, lotSize, autoTradeEnabled } = req.body;
   if (!login || !password || !server) return res.status(400).json({ error: 'Missing credentials' });
-  if (!METAAPI_TOKEN) return res.status(500).json({ error: 'MetaApi not configured' });
+  const METAAPI_TOKEN_LOCAL = process.env.METAAPI_TOKEN || ''; if (!METAAPI_TOKEN_LOCAL) return res.status(500).json({ error: 'MetaApi not configured' });
   try {
-    const r = await axios.post('https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts', { login: login.toString(), password, name: 'Pulstrade_' + login, server, platform: platform || 'mt5', magic: 20240410, application: 'MetaApi', type: 'cloud' }, { headers: { 'auth-token': METAAPI_TOKEN, 'Content-Type': 'application/json' }, timeout: 30000 });
+    const r = await axios.post('https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts', { login: login.toString(), password, name: 'Pulstrade_' + login, server, platform: platform || 'mt5', magic: 20240410, application: 'MetaApi', type: 'cloud' }, { headers: { 'auth-token': METAAPI_TOKEN_LOCAL, 'Content-Type': 'application/json' }, timeout: 30000 });
     const accountId = r.data.id;
     db.exec('CREATE TABLE IF NOT EXISTS autotrade_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT UNIQUE NOT NULL, lot_size REAL DEFAULT 0.01, auto_trade INTEGER DEFAULT 1, created_at INTEGER DEFAULT (strftime(\'%s\',\'now\') * 1000))');
     db.prepare('INSERT OR REPLACE INTO autotrade_accounts (account_id, lot_size, auto_trade) VALUES (?, ?, ?)').run(accountId, lotSize || 0.01, autoTradeEnabled ? 1 : 0);
