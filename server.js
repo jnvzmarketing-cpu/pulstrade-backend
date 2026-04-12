@@ -379,3 +379,100 @@ app.post('/webhook', express.json(), (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── MetaApi Auto Trading ──────────────────────────────────────────────────────
+const METAAPI_TOKEN = process.env.METAAPI_TOKEN || '';
+const METAAPI_URL   = 'https://mt-client-api-v1.london.agiliumtrade.ai';
+
+async function executeTrade(accountId, signal, lotSize = 0.01) {
+  if (!METAAPI_TOKEN) return null;
+  try {
+    const isBuy = signal.action === 'BUY';
+    const payload = {
+      symbol: 'XAUUSD',
+      actionType: isBuy ? 'ORDER_TYPE_BUY' : 'ORDER_TYPE_SELL',
+      volume: parseFloat(lotSize.toFixed(2)),
+      stopLoss: signal.sl ? parseFloat(signal.sl) : undefined,
+      takeProfit: signal.tp1 ? parseFloat(signal.tp1) : undefined,
+      comment: `Pulstrade ${signal.action} ${signal.fib_level || ''}`.trim(),
+    };
+    const res = await axios.post(
+      `${METAAPI_URL}/users/current/accounts/${accountId}/trade`,
+      payload,
+      { headers: { 'auth-token': METAAPI_TOKEN, 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    console.log(`✓ MetaApi trade: ${signal.action} ${payload.volume} lots`);
+    return res.data;
+  } catch (err) {
+    console.error('MetaApi error:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function getAccountInfo(accountId) {
+  if (!METAAPI_TOKEN) return null;
+  try {
+    const res = await axios.get(
+      `${METAAPI_URL}/users/current/accounts/${accountId}/account-information`,
+      { headers: { 'auth-token': METAAPI_TOKEN }, timeout: 10000 }
+    );
+    return res.data;
+  } catch (err) { return null; }
+}
+
+async function getPositions(accountId) {
+  if (!METAAPI_TOKEN) return [];
+  try {
+    const res = await axios.get(
+      `${METAAPI_URL}/users/current/accounts/${accountId}/positions`,
+      { headers: { 'auth-token': METAAPI_TOKEN }, timeout: 10000 }
+    );
+    return res.data || [];
+  } catch (err) { return []; }
+}
+
+async function autoExecuteForAllAccounts(signal) {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS autotrade_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT UNIQUE NOT NULL,
+      lot_size REAL DEFAULT 0.01,
+      auto_trade INTEGER DEFAULT 1,
+      created_at INTEGER DEFAULT (strftime('%s','now') * 1000)
+    )`);
+    const accounts = db.prepare('SELECT * FROM autotrade_accounts WHERE auto_trade = 1').all();
+    for (const acc of accounts) await executeTrade(acc.account_id, signal, acc.lot_size);
+  } catch (err) { console.error('Auto execute error:', err.message); }
+}
+
+app.post('/autotrade/connect', express.json(), (req, res) => {
+  const { accountId, lotSize, autoTradeEnabled } = req.body;
+  if (!accountId) return res.status(400).json({ error: 'accountId required' });
+  db.exec(`CREATE TABLE IF NOT EXISTS autotrade_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT UNIQUE NOT NULL,
+    lot_size REAL DEFAULT 0.01,
+    auto_trade INTEGER DEFAULT 1,
+    created_at INTEGER DEFAULT (strftime('%s','now') * 1000)
+  )`);
+  db.prepare(`INSERT OR REPLACE INTO autotrade_accounts (account_id, lot_size, auto_trade) VALUES (?, ?, ?)`)
+    .run(accountId, lotSize || 0.01, autoTradeEnabled ? 1 : 0);
+  res.json({ success: true, accountId });
+});
+
+app.get('/autotrade/account/:accountId', async (req, res) => {
+  const info = await getAccountInfo(req.params.accountId);
+  if (!info) return res.status(404).json({ error: 'Account not found' });
+  const positions = await getPositions(req.params.accountId);
+  res.json({ ...info, openPositions: positions.length, positions });
+});
+
+app.post('/autotrade/trade', express.json(), async (req, res) => {
+  const { accountId, signalId, lotSize } = req.body;
+  if (!accountId || !signalId) return res.status(400).json({ error: 'Missing params' });
+  const signal = db.prepare('SELECT * FROM signals WHERE id = ?').get(signalId);
+  if (!signal) return res.status(404).json({ error: 'Signal not found' });
+  const result = await executeTrade(accountId, signal, lotSize || 0.01);
+  if (result) res.json({ success: true, result });
+  else res.status(500).json({ error: 'Trade failed' });
+});
