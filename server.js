@@ -378,7 +378,7 @@ app.post('/webhook', express.json(), (req, res) => {
     const confidence = parseInt(data.confidence) || 0;
     const h1 = data.mtf?.h1 === true || data.mtf?.h1 === 'true';
     const h4 = data.mtf?.h4 === true || data.mtf?.h4 === 'true';
-    if (confidence < 75 || (!h1 && !h4)) {
+    if (confidence < 75) {
       console.log(`Signal filtered: confidence=${confidence}, h1=${h1}, h4=${h4}`);
       return res.status(200).json({ filtered: true, reason: 'Below quality threshold' });
     }
