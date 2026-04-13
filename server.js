@@ -489,5 +489,4 @@ async function autoExecuteForAllAccounts(signal) {
 
 // ── Scan & Listen ─────────────────────────────────────────────────────────────
 scanForSignals();
-setInterval(scanForSignals, 5 * 60 * 1000);
-app.listen(PORT, () => console.log(`Pulstrade backend v2.0 on port ${PORT}`));
+setInterval(scanForSignals, 60 * 1000);app.listen(PORT, () => console.log(`Pulstrade backend v2.0 on port ${PORT}`));
