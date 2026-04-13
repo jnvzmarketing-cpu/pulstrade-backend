@@ -114,8 +114,7 @@ function isPinBar(c, dir) {
 }
 
 function nearFib(price, fibValue, atr) {
-  return Math.abs(price - fibValue) <= (atr || fibValue * 0.001) * 0.5;
-}
+return Math.abs(price - fibValue) <= (atr || fibValue * 0.001) * 2.0;}
 
 function timeAgo(date) {
   const seconds = Math.floor((new Date() - date) / 1000);
