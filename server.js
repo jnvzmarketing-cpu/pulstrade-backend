@@ -346,8 +346,17 @@ app.post('/webhook', express.json(), (req, res) => {
     const data = req.body;
     console.log('Webhook received:', JSON.stringify(data));
 
-    if (!data.action || !data.price || !data.ticker) {
+   if (!data.action || !data.price || !data.ticker) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Quality filter — min 75% confidence, H1 or H4 required
+    const confidence = parseInt(data.confidence) || 0;
+    const h1 = data.mtf?.h1 === true || data.mtf?.h1 === 'true';
+    const h4 = data.mtf?.h4 === true || data.mtf?.h4 === 'true';
+    if (confidence < 75 || (!h1 && !h4)) {
+      console.log(`Signal filtered: confidence=${confidence}, h1=${h1}, h4=${h4}`);
+      return res.status(200).json({ filtered: true, reason: 'Below quality threshold' });
     }
 
     const signal = {
@@ -414,4 +423,5 @@ app.post('/autotrade/connect-mt5', express.json(), async (req, res) => {
     console.error('MT5 connect error:', err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.message || 'Connection failed' });
   }
+  
 });
