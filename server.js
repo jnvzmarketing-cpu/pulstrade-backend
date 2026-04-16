@@ -511,34 +511,36 @@ async function scanForSignals() {
           const pattern = confluence.patternName;
           if (!pattern || pattern === 'No pattern') continue;
 
-        // No duplicate in last 2 hours
-        const recent = db.prepare(`SELECT id FROM signals WHERE ticker=? AND action=? AND timeframe=? AND timestamp > ?`)
-          .get(TICKER, action, tf.label, Date.now() - 7200000);
-        if (recent) continue;
+          // No duplicate in last 4 hours
+          const recent = db.prepare(`SELECT id FROM signals WHERE ticker=? AND action=? AND timeframe=? AND timestamp > ?`)
+            .get(TICKER, action, tf.label, Date.now() - 4 * 3600000);
+          if (recent) continue;
 
-        const sl  = action === 'BUY'  ? check.value - (atr || 10) * 1.5 : check.value + (atr || 10) * 1.5;
-        const tp1 = action === 'BUY'  ? check.value + (atr || 10) * 3.0 : check.value - (atr || 10) * 3.0;
-        const tp2 = action === 'BUY'  ? check.value + (atr || 10) * 6.0 : check.value - (atr || 10) * 6.0;
-        const mtf = JSON.stringify({ h1: tf.label === '1H', h4: tf.label === '4H', d1: tf.label === '1D' });
+          const sl  = action === 'BUY'  ? check.value - (atr || 10) * 1.5 : check.value + (atr || 10) * 1.5;
+          const tp1 = action === 'BUY'  ? check.value + (atr || 10) * 3.0 : check.value - (atr || 10) * 3.0;
+          const tp2 = action === 'BUY'  ? check.value + (atr || 10) * 6.0 : check.value - (atr || 10) * 6.0;
+          const mtf = JSON.stringify({ h1: tf.label === '1H', h4: tf.label === '4H', d1: tf.label === '1D' });
 
-        const signal = {
-          ticker: TICKER, action,
-          price:  Math.round(price * 100) / 100,
-          sl:     Math.round(sl  * 100) / 100,
-          tp1:    Math.round(tp1 * 100) / 100,
-          tp2:    Math.round(tp2 * 100) / 100,
-          timeframe: tf.label, confidence: check.confidence,
-          fib_level: check.level, pattern,
-          rsi:    rsi  ? Math.round(rsi  * 10)  / 10  : null,
-          atr:    atr  ? Math.round(atr  * 100) / 100 : null,
-          current_price: Math.round(price * 100) / 100,
-          entry_valid_for: tf.validFor, mtf,
-          timestamp: Date.now(),
-        };
+          const signal = {
+            ticker: TICKER, action,
+            price:  Math.round(price * 100) / 100,
+            sl:     Math.round(sl  * 100) / 100,
+            tp1:    Math.round(tp1 * 100) / 100,
+            tp2:    Math.round(tp2 * 100) / 100,
+            timeframe: tf.label, confidence: confluence.score,
+            fib_level: check.level, pattern,
+            note: confluence.reasons.slice(0,3).join(' | '),
+            rsi:    rsi  ? Math.round(rsi  * 10)  / 10  : null,
+            atr:    atr  ? Math.round(atr  * 100) / 100 : null,
+            current_price: Math.round(price * 100) / 100,
+            entry_valid_for: tf.validFor, mtf,
+            timestamp: Date.now(),
+          };
 
-        db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp)
-          VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)`).run(signal);
-        console.log(`✓ Signal: ${action} ${TICKER} @ ${price} (${tf.label}, ${check.level})`);
+          db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp)
+            VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)`).run(signal);
+          console.log(`✓ Confluence Signal: ${action} ${TICKER} @ ${price} (${tf.label}, ${check.level}, score:${confluence.score})`);
+        }
       }
     } catch (err) {
       console.error(`Error scanning ${tf.label}:`, err.message);
