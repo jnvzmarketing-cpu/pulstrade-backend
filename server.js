@@ -1,8 +1,34 @@
-require('dotenv').config();
+ require('dotenv').config();
 const express  = require('express');
 const axios    = require('axios');
 const cors     = require('cors');
 const Database = require('better-sqlite3');
+
+const admin = require('firebase-admin');
+if (!admin.apps.length) {
+  try {
+    const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+    if (sa.project_id) { admin.initializeApp({ credential: admin.credential.cert(sa) }); console.log('✓ Firebase Admin OK'); }
+    else { console.warn('⚠️ Push notifications disabled — set FIREBASE_SERVICE_ACCOUNT'); }
+  } catch(e) { console.warn('Firebase Admin error:', e.message); }
+}
+
+async function sendSignalPush(signal) {
+  try {
+    if (!admin.apps.length) return;
+    const emoji = signal.action === 'BUY' ? '📈' : '📉';
+    const title = `${emoji} ${signal.action} Signal — XAU/USD`;
+    const body  = `Entry: $${signal.price} | FIB ${signal.fib_level || ''} | ${signal.confidence || 0}% Confluence`;
+    await admin.messaging().send({
+      topic: 'signals',
+      notification: { title, body },
+      data: { action: signal.action, price: String(signal.price), confidence: String(signal.confidence || 0) },
+      apns: { payload: { aps: { sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
+      android: { priority: 'high', notification: { title, body, channelId: 'pulstrade_signals', priority: 'max' } },
+    });
+    console.log(`✓ Push sent: ${title}`);
+  } catch(e) { console.error('Push error:', e.message); }
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -540,11 +566,23 @@ async function scanForSignals() {
           db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp)
             VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)`).run(signal);
           console.log(`✓ Confluence Signal: ${action} ${TICKER} @ ${price} (${tf.label}, ${check.level}, score:${confluence.score})`);
+          const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
+          sendSignalPush({ ...signal, id: inserted.id });
         }
       }
     } catch (err) {
       console.error(`Error scanning ${tf.label}:`, err.message);
     }
+  }
+
+  // Weekend check — no new signals when market closed
+  const now = new Date();
+  const day = now.getUTCDay(); // 0=Sun, 6=Sat
+  const hour = now.getUTCHours();
+  const isFxClosed = (day === 6) || (day === 0) || (day === 5 && hour >= 21) || (day === 1 && hour < 1);
+  if (isFxClosed) {
+    console.log('Market closed — skipping signal scan');
+    return;
   }
 
   // Seed if empty
@@ -714,6 +752,7 @@ app.post('/webhook', express.json(), (req, res) => {
       VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)`).run(signal);
 
     console.log(`✓ Signal saved: ${signal.action} ${signal.ticker} @ ${signal.price}`);
+    sendSignalPush({ ...signal, id: db.prepare('SELECT last_insert_rowid() as id').get().id });
     res.json({ success: true, signal });
   } catch (err) {
     console.error('Webhook error:', err.message);
