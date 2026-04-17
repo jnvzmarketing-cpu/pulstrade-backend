@@ -418,8 +418,8 @@ async function scanForSignalsV2(db, fetchCandles, TICKER) {
         const tolerance = atr * 2.0;
         if (Math.abs(price - fibValue) > tolerance) continue;
 
-        const isBuyZone  = price < swingHigh - fibRange * 0.3;
-        const isSellZone = price > swingLow  + fibRange * 0.3;
+        const isBuyZone  = price < swingLow  + fibRange * 0.4;
+const isSellZone = price > swingHigh - fibRange * 0.4;
 
         for (const action of ['BUY', 'SELL']) {
           if (action === 'BUY'  && !isBuyZone)  continue;
