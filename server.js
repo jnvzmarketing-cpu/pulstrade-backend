@@ -342,25 +342,39 @@ async function scanForSignals() {
             continue;
           }
 
-          // No duplicate in last 4h
+          // Kein Duplikat: gleicher Action + gleicher FIB Level + gleicher Timeframe in letzten 2h
           const recent = db.prepare(
-            `SELECT id FROM signals WHERE ticker=? AND action=? AND timeframe=? AND timestamp > ?`
-          ).get(TICKER, action, tf.label, Date.now()-4*3600000);
-          if (recent) continue;
+            `SELECT id FROM signals WHERE ticker=? AND action=? AND fib_level=? AND timeframe=? AND timestamp > ?`
+          ).get(TICKER, action, fibName, tf.label, Date.now()-2*3600000);
+          if (recent) {
+            console.log(`[${tf.label}] ${action} ${fibName} skipped — same level traded recently`);
+            continue;
+          }
 
           // SL/TP via next FIB level
           const fibValues = Object.values(fibs).sort((a,b)=>a-b);
           let sl, tp1, tp2;
+          // SL unter/über nächstem FIB Level + 1.5 ATR Buffer
+          const fibValuesSorted = Object.values(fibs).sort((a,b)=>a-b);
           if (action==='BUY') {
-            const nextDown = fibValues.filter(f=>f<fibValue).pop() || fibValue-atr*2;
-            sl  = Math.round((nextDown - atr*0.5)*100)/100;
-            tp1 = Math.round((fibValue + atr*3)*100)/100;
-            tp2 = Math.round((fibValue + atr*6)*100)/100;
+            const nextDown = fibValuesSorted.filter(f=>f<fibValue).pop() || swingLow - atr;
+            sl  = Math.round((nextDown - atr*1.5)*100)/100;
+            tp1 = Math.round((fibValue + atr*3.0)*100)/100;
+            tp2 = Math.round((fibValue + atr*5.0)*100)/100;
           } else {
-            const nextUp = fibValues.filter(f=>f>fibValue).shift() || fibValue+atr*2;
-            sl  = Math.round((nextUp   + atr*0.5)*100)/100;
-            tp1 = Math.round((fibValue - atr*3)*100)/100;
-            tp2 = Math.round((fibValue - atr*6)*100)/100;
+            const nextUp = fibValuesSorted.filter(f=>f>fibValue).shift() || swingHigh + atr;
+            sl  = Math.round((nextUp   + atr*1.5)*100)/100;
+            tp1 = Math.round((fibValue - atr*3.0)*100)/100;
+            tp2 = Math.round((fibValue - atr*5.0)*100)/100;
+          }
+
+          // R:R Check — mindestens 1:2
+          const risk   = Math.abs(price - sl);
+          const reward = Math.abs(tp1 - price);
+          const rr     = risk > 0 ? reward / risk : 0;
+          if (rr < 2.0) {
+            console.log(`[${tf.label}] ${action} filtered — R:R ${rr.toFixed(1)} < 2.0`);
+            continue;
           }
 
           const signal = {
