@@ -73,6 +73,48 @@ db.exec(`
   );
 `);
 
+// ── CLEANUP — remove old 1D signals (wrong price data) ──────────────────────
+try {
+  const deleted1D = db.prepare("DELETE FROM signals WHERE timeframe = '1D'").run();
+  console.log(`✓ Cleanup: deleted ${deleted1D.changes} old 1D signals with wrong price data`);
+} catch(e) { console.error('Cleanup error:', e.message); }
+
+// ── CLEANUP — remove old signals with stale price (>7 days) ──────────────
+try {
+  const staleCutoff = Date.now() - 7*24*3600000;
+  const deletedStale = db.prepare("DELETE FROM signals WHERE timestamp < ?").run(staleCutoff);
+  console.log(`✓ Cleanup: deleted ${deletedStale.changes} old signals older than 7 days`);
+} catch(e) { console.error('Stale cleanup error:', e.message); }
+
+// ── PRICE CACHE — single source of truth, updated every 30s ──────────────
+let cachedPrice = { price: null, timestamp: 0 };
+const PRICE_CACHE_TTL = 30 * 1000; // 30 seconds
+
+async function fetchLivePriceFromSource() {
+  if (!TWELVE_API_KEY) return null;
+  try {
+    const r = await axios.get(
+      `https://api.twelvedata.com/price?symbol=${encodeURIComponent(TICKER)}&apikey=${TWELVE_API_KEY}`,
+      { timeout: 5000 }
+    );
+    const p = parseFloat(r.data?.price);
+    if (!isNaN(p) && p > 0) {
+      cachedPrice = { price: p, timestamp: Date.now() };
+      console.log(`✓ Price updated: $${p.toFixed(2)}`);
+      return p;
+    }
+    if (r.data?.code === 429) console.warn('⚠️ Twelve Data rate limit reached');
+    return null;
+  } catch(e) {
+    console.error('Price fetch error:', e.message);
+    return null;
+  }
+}
+
+// Initial fetch + refresh every 30s
+fetchLivePriceFromSource();
+setInterval(fetchLivePriceFromSource, PRICE_CACHE_TTL);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function timeAgo(date) {
   const s = Math.floor((new Date() - date) / 1000);
@@ -112,24 +154,41 @@ function isMarketClosed() {
   return day === 6 || day === 0 || (day === 5 && hour >= 21) || (day === 1 && hour < 1);
 }
 
-// ── Fetch Candles ─────────────────────────────────────────────────────────────
+// ── CANDLE CACHE — cache candles per interval for 5 minutes ──────────────
+const candleCache = {};
+const CANDLE_CACHE_TTL = 5 * 60 * 1000;
+
 async function fetchCandles(interval, outputsize=60) {
+  const cacheKey = `${interval}_${outputsize}`;
+  const cached = candleCache[cacheKey];
+  if (cached && (Date.now() - cached.timestamp) < CANDLE_CACHE_TTL) {
+    return cached.data;
+  }
+
   if (!TWELVE_API_KEY) return generateMockCandles(outputsize);
   try {
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(TICKER)}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_API_KEY}&format=JSON`;
     const res = await axios.get(url, { timeout: 10000 });
-    if (!res.data?.values) return generateMockCandles(outputsize);
-    return res.data.values.map(v => ({
+    if (!res.data?.values) {
+      if (res.data?.code === 429) console.warn(`⚠️ Rate limit on ${interval} candles`);
+      return cached?.data || generateMockCandles(outputsize);
+    }
+    const candles = res.data.values.map(v => ({
       open: parseFloat(v.open), high: parseFloat(v.high),
       low:  parseFloat(v.low),  close: parseFloat(v.close),
       timestamp: new Date(v.datetime).getTime(),
     }));
-  } catch(e) { return generateMockCandles(outputsize); }
+    candleCache[cacheKey] = { data: candles, timestamp: Date.now() };
+    return candles;
+  } catch(e) {
+    return cached?.data || generateMockCandles(outputsize);
+  }
 }
 
 function generateMockCandles(count) {
   const candles = [];
-  let price = 3300 + Math.random()*30;
+  const basePrice = cachedPrice.price || 3300;
+  let price = basePrice + Math.random()*30;
   const now = Date.now();
   for (let i=count-1; i>=0; i--) {
     const change = (Math.random()-0.5)*15;
@@ -147,13 +206,11 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   const closes = candles.map(c => c.close);
   const price  = closes[0];
 
-  // FIB Quality (0-25)
   const fibScores = { '61.8%':25, '50.0%':20, '38.2%':18, '78.6%':15, '23.6%':10 };
   const fibScore  = fibScores[fibLevel] || 10;
   score += fibScore;
   reasons.push(`FIB ${fibLevel}: +${fibScore}pts`);
 
-  // RSI (0-20)
   let rsiScore = 0;
   if (action === 'BUY') {
     if (rsi >= 25 && rsi <= 45)      { rsiScore=20; reasons.push('RSI oversold: +20pts'); }
@@ -168,8 +225,6 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   }
   score += rsiScore;
 
-  // ── TREND FILTER — EMA50 vs EMA200 (0-20) ────────────────────────────────
-  // KEY FIX: BUY only allowed in uptrend, SELL only in downtrend
   const ema20  = calcEMA(closes, Math.min(20, closes.length-1));
   const ema50  = calcEMA(closes, Math.min(50, closes.length-1));
   const ema200 = calcEMA(closes, Math.min(200, closes.length-1));
@@ -180,7 +235,6 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   let emaScore = 0;
   if (action === 'BUY') {
     if (!uptrend) {
-      // Counter-trend BUY in downtrend — hard penalty, almost always filtered
       emaScore = -10;
       reasons.push('Counter-trend BUY (downtrend): -10pts');
     } else {
@@ -191,7 +245,6 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
     }
   } else {
     if (!downtrend) {
-      // Counter-trend SELL in uptrend — hard penalty
       emaScore = -10;
       reasons.push('Counter-trend SELL (uptrend): -10pts');
     } else {
@@ -203,7 +256,6 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   }
   score += emaScore;
 
-  // Bollinger Bands (0-15)
   const bb = calcBollingerBands(closes);
   let bbScore = 0;
   if (bb) {
@@ -214,7 +266,6 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   }
   score += bbScore;
 
-  // Candlestick Pattern (0-20)
   const c0=candles[0], c1=candles[1];
   const body0  = Math.abs(c0.close-c0.open);
   const range0 = c0.high-c0.low;
@@ -237,35 +288,39 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
 
 // ── MAIN SCANNER ──────────────────────────────────────────────────────────────
 async function scanForSignals() {
-  // Weekend / market closed check
-  if (isMarketClosed()) {
-    console.log('Market closed — skipping scan');
-    return;
-  }
+  if (isMarketClosed()) { console.log('Market closed — skipping scan'); return; }
+  if (isEconomicEventSoon(30)) { console.log('⚠️ Economic event soon — scan blocked'); return; }
 
-  // Economic event block
-  if (isEconomicEventSoon(30)) {
-    console.log('⚠️ Economic event soon — scan blocked');
+  // Skip scan if no live price available
+  if (!cachedPrice.price) {
+    console.log('⚠️ No live price cached — skipping scan');
     return;
   }
 
   const timeframes = [
-    { label:'1H', interval:'1h',   validFor:2,  minScore:75 },
-    { label:'4H', interval:'4h',   validFor:8,  minScore:73 },
+    { label:'1H', interval:'1h', validFor:2, minScore:75 },
+    { label:'4H', interval:'4h', validFor:8, minScore:73 },
   ];
 
   const newSignals = [];
 
   for (const tf of timeframes) {
     try {
-      // Need 200+ candles for EMA200
       const candles = await fetchCandles(tf.interval, 220);
       if (!candles || candles.length < 30) continue;
 
       const closes = candles.map(c => c.close);
       const price  = closes[0];
 
-      // ── MASTER TREND CHECK ────────────────────────────────────────────────
+      // VALIDATE: price must be close to live price (protect against stale data)
+      if (cachedPrice.price) {
+        const deviation = Math.abs(price - cachedPrice.price) / cachedPrice.price;
+        if (deviation > 0.05) {
+          console.log(`⚠️ [${tf.label}] Candle price ${price.toFixed(2)} deviates ${(deviation*100).toFixed(1)}% from live ${cachedPrice.price.toFixed(2)} — skipping (stale data)`);
+          continue;
+        }
+      }
+
       const ema50  = calcEMA(closes, Math.min(50, closes.length-1));
       const ema200 = calcEMA(closes, Math.min(200, closes.length-1));
       const masterUptrend   = ema50 && ema200 && ema50 > ema200;
@@ -273,7 +328,6 @@ async function scanForSignals() {
 
       console.log(`[${tf.label}] Price:${price.toFixed(2)} EMA50:${ema50?.toFixed(2)} EMA200:${ema200?.toFixed(2)} Trend:${masterUptrend?'UP':masterDowntrend?'DOWN':'NEUTRAL'}`);
 
-      // Swing high/low from last 30 candles
       let swingHigh=-Infinity, swingLow=Infinity;
       for (let i=0; i<30; i++) {
         if (candles[i].high > swingHigh) swingHigh=candles[i].high;
@@ -288,7 +342,6 @@ async function scanForSignals() {
         '78.6%': swingHigh - fibRange*0.786,
       };
 
-      // ATR
       let atrSum=0;
       for (let i=0; i<14; i++) {
         atrSum += Math.max(
@@ -299,7 +352,6 @@ async function scanForSignals() {
       }
       const atr = Math.round((atrSum/14)*100)/100;
 
-      // RSI
       let gains=0, losses=0;
       for (let i=1; i<=14; i++) {
         const diff = closes[i-1]-closes[i];
@@ -311,20 +363,13 @@ async function scanForSignals() {
         const tolerance = atr * 2.0;
         if (Math.abs(price - fibValue) > tolerance) continue;
 
-        // ── ZONE FILTER ───────────────────────────────────────────────────
-        // BUY zone = price near swing LOW (bottom of range)
-        // SELL zone = price near swing HIGH (top of range)
         const isBuyZone  = price < swingLow  + fibRange * 0.45;
         const isSellZone = price > swingHigh - fibRange * 0.45;
 
         for (const action of ['BUY', 'SELL']) {
-          // Zone check
           if (action==='BUY'  && !isBuyZone)  continue;
           if (action==='SELL' && !isSellZone) continue;
 
-          // ── MASTER TREND GATE — most important filter ─────────────────
-          // Only allow BUY in uptrend, only SELL in downtrend
-          // Exception: neutral trend (no clear EMA cross) allows both
           if (action==='BUY'  && masterDowntrend) {
             console.log(`[${tf.label}] BUY blocked — master downtrend (EMA50<EMA200)`);
             continue;
@@ -341,7 +386,6 @@ async function scanForSignals() {
             continue;
           }
 
-          // Kein Duplikat: gleicher Action + gleicher FIB Level + gleicher Timeframe in letzten 2h
           const recent = db.prepare(
             `SELECT id FROM signals WHERE ticker=? AND action=? AND fib_level=? AND timeframe=? AND timestamp > ?`
           ).get(TICKER, action, fibName, tf.label, Date.now()-2*3600000);
@@ -350,10 +394,7 @@ async function scanForSignals() {
             continue;
           }
 
-          // SL/TP via next FIB level
-          const fibValues = Object.values(fibs).sort((a,b)=>a-b);
           let sl, tp1, tp2;
-          // SL unter/über nächstem FIB Level + 1.5 ATR Buffer
           const fibValuesSorted = Object.values(fibs).sort((a,b)=>a-b);
           if (action==='BUY') {
             const nextDown = fibValuesSorted.filter(f=>f<fibValue).pop() || swingLow - atr;
@@ -367,7 +408,6 @@ async function scanForSignals() {
             tp2 = Math.round((fibValue - atr*5.0)*100)/100;
           }
 
-          // R:R Check — mindestens 1:2
           const risk   = Math.abs(price - sl);
           const reward = Math.abs(tp1 - price);
           const rr     = risk > 0 ? reward / risk : 0;
@@ -389,7 +429,7 @@ async function scanForSignals() {
             atr,
             current_price:   Math.round(price*100)/100,
             entry_valid_for: tf.validFor,
-            mtf: JSON.stringify({ h1:tf.label==='1H', h4:tf.label==='4H', d1:tf.label==='1D' }),
+            mtf: JSON.stringify({ h1:tf.label==='1H', h4:tf.label==='4H', d1:false }),
             timestamp: Date.now(),
           };
 
@@ -409,44 +449,18 @@ async function scanForSignals() {
     }
   }
 
-  // Seed if DB empty
-  const count = db.prepare('SELECT COUNT(*) as c FROM signals').get().c;
-  if (count === 0) await seedSignals();
-
   return newSignals;
 }
 
-async function seedSignals() {
-  let price = 3300;
-  try {
-    if (TWELVE_API_KEY) {
-      const r = await axios.get(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(TICKER)}&apikey=${TWELVE_API_KEY}`, { timeout:5000 });
-      price = parseFloat(r.data.price) || price;
-    }
-  } catch(_) {}
-  const now = Date.now();
-  const seeds = [
-    { action:'BUY',  fib:'61.8%', conf:82, tf:'1H',  validFor:2,  rsi:34.2, atr:12.4, pattern:'Bullish Pin Bar',    offset:3*60000 },
-    { action:'SELL', fib:'38.2%', conf:78, tf:'4H',  validFor:8,  rsi:67.8, atr:18.6, pattern:'Bearish Engulfing',  offset:80*60000 },
-    { action:'BUY',  fib:'50.0%', conf:75, tf:'4H',  validFor:8,  rsi:42.1, atr:15.8, pattern:'Doji on 50% FIB',   offset:225*60000 },
-    { action:'SELL', fib:'61.8%', conf:80, tf:'1D',  validFor:24, rsi:71.2, atr:28.4, pattern:'Bearish Pin Bar',    offset:22*3600000 },
-  ];
-  for (const s of seeds) {
-    const sl  = s.action==='BUY' ? price-s.atr*1.5 : price+s.atr*1.5;
-    const tp1 = s.action==='BUY' ? price+s.atr*3.0 : price-s.atr*3.0;
-    const tp2 = s.action==='BUY' ? price+s.atr*6.0 : price-s.atr*6.0;
-    db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(TICKER,s.action,Math.round(price*100)/100,Math.round(sl*100)/100,Math.round(tp1*100)/100,Math.round(tp2*100)/100,
-           s.tf,s.conf,s.fib,s.pattern,s.rsi,s.atr,Math.round(price*100)/100,s.validFor,
-           JSON.stringify({h1:s.tf==='1H',h4:s.tf==='4H',d1:s.tf==='1D'}),now-s.offset);
-  }
-  console.log(`✓ Seeded ${seeds.length} signals @ $${price}`);
-}
-
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.get('/',       (req,res) => res.json({ status:'Pulstrade Backend', version:'3.0.0' }));
-app.get('/health', (req,res) => res.json({ status:'ok', signals:db.prepare('SELECT COUNT(*) as c FROM signals').get().c, marketClosed:isMarketClosed() }));
+app.get('/',       (req,res) => res.json({ status:'Pulstrade Backend', version:'3.2.0-cached' }));
+app.get('/health', (req,res) => res.json({
+  status:'ok',
+  signals:db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
+  marketClosed:isMarketClosed(),
+  priceCache: cachedPrice,
+  cacheAge: cachedPrice.timestamp ? Math.floor((Date.now()-cachedPrice.timestamp)/1000) + 's' : 'none',
+}));
 
 app.get('/signals', (req,res) => {
   const limit  = parseInt(req.query.limit)||50;
@@ -463,22 +477,27 @@ app.get('/signals/:id', (req,res) => {
   res.json({...row, mtf:row.mtf?JSON.parse(row.mtf):null});
 });
 
-app.get('/price', async (req,res) => {
-  try {
-    if (!TWELVE_API_KEY) return res.json({price:3300.0,ticker:TICKER});
-    const r = await axios.get(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(TICKER)}&apikey=${TWELVE_API_KEY}`,{timeout:5000});
-    res.json({price:parseFloat(r.data.price),ticker:TICKER});
-  } catch(e) { res.json({price:3300.0,ticker:TICKER}); }
+// ── /price — serves CACHED price, no Twelve Data call per request ───────
+app.get('/price', (req,res) => {
+  if (cachedPrice.price) {
+    return res.json({
+      price: cachedPrice.price,
+      ticker: TICKER,
+      cached: true,
+      age: Math.floor((Date.now()-cachedPrice.timestamp)/1000),
+    });
+  }
+  // No cache yet — try a single fetch
+  fetchLivePriceFromSource().then(p => {
+    res.json({ price: p, ticker: TICKER, cached: false });
+  });
 });
 
 app.get('/candles', async (req,res) => {
   try {
     const interval=req.query.interval||'5min', outputsize=req.query.limit||100;
-    if (!TWELVE_API_KEY) return res.json(generateMockCandles(parseInt(outputsize)));
-    const url=`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(TICKER)}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_API_KEY}&format=JSON`;
-    const r = await axios.get(url,{timeout:10000});
-    if (!r.data?.values) return res.json(generateMockCandles(parseInt(outputsize)));
-    res.json(r.data.values.map(v=>({time:new Date(v.datetime).getTime(),open:parseFloat(v.open),high:parseFloat(v.high),low:parseFloat(v.low),close:parseFloat(v.close)})).reverse());
+    const data = await fetchCandles(interval, parseInt(outputsize));
+    res.json(data.map(c=>({time:c.timestamp,open:c.open,high:c.high,low:c.low,close:c.close})).reverse());
   } catch(e) { res.json(generateMockCandles(100)); }
 });
 
@@ -540,30 +559,15 @@ async function autoExecuteForAllAccounts(signal) {
   } catch(e) { console.error('Auto execute error:',e.message); }
 }
 
-
-// ── Economic Calendar — Live from TradingEconomics / Fallback ────────────────
 app.get('/calendar', async (req, res) => {
   try {
-    // Try fetching from a free economic calendar source
     const now = new Date();
-    const weekStart = new Date(now);
-    weekStart.setDate(now.getDate() - now.getDay() + 1); // Monday
-    const weekEnd = new Date(weekStart);
-    weekEnd.setDate(weekStart.getDate() + 6); // Sunday
-
-    const formatDate = d => d.toISOString().split('T')[0];
-
-    // Use Twelve Data economic calendar if available
-    // Fallback: generate smart calendar based on current week
     const events = generateWeeklyCalendar(now);
     res.json(events);
-  } catch(e) {
-    res.json(generateWeeklyCalendar(new Date()));
-  }
+  } catch(e) { res.json(generateWeeklyCalendar(new Date())); }
 });
 
 function generateWeeklyCalendar(now) {
-  // Get current week's dates
   const day = now.getUTCDay();
   const monday = new Date(now);
   monday.setUTCDate(now.getUTCDate() - (day === 0 ? 6 : day - 1));
@@ -576,40 +580,27 @@ function generateWeeklyCalendar(now) {
     return d.toISOString();
   };
 
-  const weekNum = Math.ceil(now.getUTCDate() / 7);
-  const month   = now.getUTCMonth(); // 0-indexed
-
-  // Generate realistic rotating calendar based on week of month
   const allEvents = [
-    // Monday events
     { title: 'EUR CPI Flash Estimate', currency: 'EUR', category: 'Inflation',    impact: 'high',   time: getDay(0, 10, 0),  forecast: '2.2%',  previous: '2.3%', actual: null },
     { title: 'US ISM Manufacturing',   currency: 'USD', category: 'Business',     impact: 'medium', time: getDay(0, 15, 0),  forecast: '48.5',  previous: '47.8', actual: null },
-    // Tuesday events  
     { title: 'US CPI (MoM)',           currency: 'USD', category: 'Inflation',    impact: 'high',   time: getDay(1, 13, 30), forecast: '0.3%',  previous: '0.4%', actual: null },
     { title: 'US CPI (YoY)',           currency: 'USD', category: 'Inflation',    impact: 'high',   time: getDay(1, 13, 30), forecast: '3.2%',  previous: '3.5%', actual: null },
     { title: 'RBA Rate Decision',      currency: 'AUD', category: 'Central Bank', impact: 'medium', time: getDay(1, 3, 30),  forecast: '4.35%', previous: '4.35%', actual: null },
-    // Wednesday events
     { title: 'FOMC Meeting Minutes',   currency: 'USD', category: 'Central Bank', impact: 'high',   time: getDay(2, 19, 0),  forecast: '—',     previous: '—',    actual: null },
     { title: 'US PPI (MoM)',           currency: 'USD', category: 'Inflation',    impact: 'medium', time: getDay(2, 13, 30), forecast: '0.2%',  previous: '0.2%', actual: null },
     { title: 'EIA Crude Oil Stocks',   currency: 'USD', category: 'Energy',       impact: 'medium', time: getDay(2, 15, 30), forecast: '-1.2M', previous: '2.1M', actual: null },
-    // Thursday events
     { title: 'US Jobless Claims',      currency: 'USD', category: 'Employment',   impact: 'medium', time: getDay(3, 13, 30), forecast: '215K',  previous: '210K', actual: null },
     { title: 'ECB Rate Decision',      currency: 'EUR', category: 'Central Bank', impact: 'high',   time: getDay(3, 13, 15), forecast: '4.50%', previous: '4.50%', actual: null },
     { title: 'US GDP (QoQ)',           currency: 'USD', category: 'Growth',       impact: 'high',   time: getDay(3, 13, 30), forecast: '2.1%',  previous: '3.1%', actual: null },
-    // Friday events
     { title: 'US Non-Farm Payrolls',   currency: 'USD', category: 'Employment',   impact: 'high',   time: getDay(4, 13, 30), forecast: '185K',  previous: '175K', actual: null },
     { title: 'US Unemployment Rate',   currency: 'USD', category: 'Employment',   impact: 'high',   time: getDay(4, 13, 30), forecast: '3.8%',  previous: '3.9%', actual: null },
     { title: 'US Core PCE Price Index',currency: 'USD', category: 'Inflation',    impact: 'high',   time: getDay(4, 13, 30), forecast: '0.3%',  previous: '0.3%', actual: null },
     { title: 'UoM Consumer Sentiment', currency: 'USD', category: 'Sentiment',    impact: 'medium', time: getDay(4, 15, 0),  forecast: '78.5',  previous: '76.9', actual: null },
   ];
 
-  // Filter to only show events from today onwards + past 24h
   const cutoff = new Date(now.getTime() - 24 * 3600000);
-  const filtered = allEvents
-    .filter(e => new Date(e.time) >= cutoff)
-    .sort((a, b) => new Date(a.time) - new Date(b.time));
+  const filtered = allEvents.filter(e => new Date(e.time) >= cutoff).sort((a, b) => new Date(a.time) - new Date(b.time));
 
-  // Add countdown and format time
   return filtered.map(e => {
     const eventTime = new Date(e.time);
     const diff = eventTime - now;
@@ -620,7 +611,7 @@ function generateWeeklyCalendar(now) {
     if (diff < 0 && diff > -3600000)     timeLabel = 'Just released';
     else if (diff < 0)                    timeLabel = `${Math.abs(diffH)}h ago`;
     else if (diffMin < 60)                timeLabel = `in ${diffMin}min ⚡`;
-    else if (diffH < 24)                  timeLabel = `Today ${eventTime.getUTCHours().toString().padStart(2,'0')}:${eventTime.getUTCMinutes().toString().padLeft ? eventTime.getUTCMinutes().toString().padStart(2,'0') : '00'} UTC`;
+    else if (diffH < 24)                  timeLabel = `Today ${eventTime.getUTCHours().toString().padStart(2,'0')}:${eventTime.getUTCMinutes().toString().padStart(2,'0')} UTC`;
     else {
       const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
       timeLabel = `${days[eventTime.getUTCDay()]} ${eventTime.getUTCHours().toString().padStart(2,'0')}:${eventTime.getUTCMinutes().toString().padStart(2,'0')} UTC`;
@@ -629,19 +620,11 @@ function generateWeeklyCalendar(now) {
     const isSoon = diff > 0 && diffMin <= 30;
     const isPast = diff < 0;
 
-    return {
-      ...e,
-      timeLabel,
-      isSoon,
-      isPast,
-      timestamp: eventTime.getTime(),
-    };
+    return { ...e, timeLabel, isSoon, isPast, timestamp: eventTime.getTime() };
   });
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 scanForSignals();
 setInterval(scanForSignals, 5*60*1000);
-app.listen(PORT, () => console.log(`Pulstrade backend v3.0 on port ${PORT}`));
-
-// wird unten ersetzt — placeholder
+app.listen(PORT, () => console.log(`Pulstrade backend v3.2 on port ${PORT} — with price caching`));
