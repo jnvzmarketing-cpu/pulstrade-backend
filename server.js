@@ -252,7 +252,6 @@ async function scanForSignals() {
   const timeframes = [
     { label:'1H', interval:'1h',   validFor:2,  minScore:75 },
     { label:'4H', interval:'4h',   validFor:8,  minScore:73 },
-    { label:'1D', interval:'1day', validFor:24, minScore:70 },
   ];
 
   const newSignals = [];
