@@ -256,12 +256,12 @@ function scanFibPullback(candles, tf) {
   const signals = [];
 
   for (const [fibName, fibValue] of Object.entries(fibs)) {
-    const tolerance = atr * 1.5;
+    const tolerance = atr * 2.0;
     if (Math.abs(price - fibValue) > tolerance) continue;
 
     const action = uptrend ? 'BUY' : 'SELL';
-    const isBuyZone  = price < swingLow  + fibRange * 0.45;
-    const isSellZone = price > swingHigh - fibRange * 0.45;
+    const isBuyZone  = price < swingLow  + fibRange * 0.55;
+    const isSellZone = price > swingHigh - fibRange * 0.55;
     if (action==='BUY'  && !isBuyZone)  continue;
     if (action==='SELL' && !isSellZone) continue;
 
@@ -368,7 +368,7 @@ function scanRangeBounce(candles, tf) {
     const tp2 = Math.round((rangeHigh - rangeSize*0.15)*100)/100;
     const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-    if (rr >= 1.8 && score >= 60) {
+    if (rr >= 1.5 && score >= 50) {
       signals.push({
         action: 'BUY', price: Math.round(price*100)/100,
         sl, tp1, tp2,
@@ -402,7 +402,7 @@ function scanRangeBounce(candles, tf) {
     const tp2 = Math.round((rangeLow + rangeSize*0.15)*100)/100;
     const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-    if (rr >= 1.8 && score >= 60) {
+    if (rr >= 1.5 && score >= 50) {
       signals.push({
         action: 'SELL', price: Math.round(price*100)/100,
         sl, tp1, tp2,
@@ -462,7 +462,7 @@ function scanBreakout(candles, tf) {
       const tp2 = Math.round((price + consRange*1.5)*100)/100;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (rr >= 1.5 && score >= 60) {
+      if (rr >= 1.5 && score >= 50) {
         signals.push({
           action: 'BUY', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -498,7 +498,7 @@ function scanBreakout(candles, tf) {
       const tp2 = Math.round((price - consRange*1.5)*100)/100;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (rr >= 1.5 && score >= 60) {
+      if (rr >= 1.5 && score >= 50) {
         signals.push({
           action: 'SELL', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -525,10 +525,10 @@ async function scanForSignals() {
   if (!cachedPrice.price) { console.log('⚠️ No live price'); return; }
 
   const timeframes = [
-    { label: '15m', interval: '15min', validFor: 0.5, minScore: 70 },
-    { label: '30m', interval: '30min', validFor: 1,   minScore: 72 },
-    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 75 },
-    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 73 },
+    { label: '15m', interval: '15min', validFor: 0.5, minScore: 60 },
+    { label: '30m', interval: '30min', validFor: 1,   minScore: 62 },
+    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 65 },
+    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 63 },
   ];
 
   for (const tf of timeframes) {
@@ -647,7 +647,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.0.0-multistrat' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.1.0-loosened' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -805,6 +805,54 @@ app.post('/autotrade/connect', express.json(), (req,res) => {
   if (!accountId) return res.status(400).json({error:'Missing'});
   db.prepare('UPDATE autotrade_accounts SET auto_trade=? WHERE account_id=?').run(autoTradeEnabled?1:0,accountId);
   res.json({success:true});
+});
+
+// ── DEBUG SCANNER — shows why signals are filtered ─────────
+app.get('/scan-debug', async (req, res) => {
+  const results = { timestamp: new Date().toISOString(), livePrice: cachedPrice.price, timeframes: {} };
+  const timeframes = [
+    { label: '15m', interval: '15min', validFor: 0.5, minScore: 60 },
+    { label: '30m', interval: '30min', validFor: 1,   minScore: 62 },
+    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 65 },
+    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 63 },
+  ];
+
+  for (const tf of timeframes) {
+    try {
+      const candles = await fetchCandles(tf.interval, 220);
+      if (!candles || candles.length < 30) { results.timeframes[tf.label] = { error: 'not enough candles' }; continue; }
+      const closes = candles.map(c => c.close);
+      const price = closes[0];
+      const ema50 = calcEMA(closes, 50);
+      const ema200 = calcEMA(closes, 200);
+      const rsi = calcRSI(closes);
+      const atr = calcATR(candles);
+      
+      const fibSignals    = scanFibPullback(candles, tf);
+      const rangeSignals  = scanRangeBounce(candles, tf);
+      const breakoutSigs  = scanBreakout(candles, tf);
+      
+      results.timeframes[tf.label] = {
+        price: price.toFixed(2),
+        ema50: ema50 ? ema50.toFixed(2) : null,
+        ema200: ema200 ? ema200.toFixed(2) : null,
+        rsi, atr,
+        trend: ema50 && ema200 ? (ema50 > ema200 ? 'UP' : 'DOWN') : 'NEUTRAL',
+        minScore: tf.minScore,
+        fib: { count: fibSignals.length, signals: fibSignals.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore,fibLevel:s.fib_level})) },
+        range: { count: rangeSignals.length, signals: rangeSignals.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore})) },
+        breakout: { count: breakoutSigs.length, signals: breakoutSigs.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore})) },
+      };
+    } catch(e) { results.timeframes[tf.label] = { error: e.message }; }
+  }
+  res.json(results);
+});
+
+// ── FORCE SCAN — manually trigger scanner ──────────────────
+app.post('/force-scan', async (req, res) => {
+  await scanForSignals();
+  const newSignals = db.prepare('SELECT COUNT(*) as c FROM signals WHERE timestamp > ?').get(Date.now() - 60000).c;
+  res.json({ triggered: true, newSignalsInLast60s: newSignals });
 });
 
 app.get('/calendar', async (req, res) => {
