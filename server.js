@@ -9,8 +9,8 @@ if (!admin.apps.length) {
   try {
     const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
     if (sa.project_id) { admin.initializeApp({ credential: admin.credential.cert(sa) }); console.log('✓ Firebase Admin OK'); }
-    else { console.warn('⚠️ Push notifications disabled — set FIREBASE_SERVICE_ACCOUNT'); }
-  } catch(e) { console.warn('Firebase Admin error:', e.message); }
+    else { console.warn('⚠️ Push disabled'); }
+  } catch(e) { console.warn('Firebase error:', e.message); }
 }
 
 async function sendSignalPush(signal) {
@@ -18,7 +18,7 @@ async function sendSignalPush(signal) {
     if (!admin.apps.length) return;
     const emoji = signal.action === 'BUY' ? '📈' : '📉';
     const title = `${emoji} ${signal.action} Signal — XAU/USD`;
-    const body  = `Entry: $${signal.price} | FIB ${signal.fib_level || ''} | ${signal.confidence || 0}% Confluence`;
+    const body  = `${signal.strategy || 'FIB'} · Entry: $${signal.price} · ${signal.confidence || 0}% Confidence`;
     await admin.messaging().send({
       topic: 'signals',
       notification: { title, body },
@@ -26,7 +26,7 @@ async function sendSignalPush(signal) {
       apns: { payload: { aps: { sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
       android: { priority: 'high', notification: { title, body, channelId: 'pulstrade_signals', priority: 'max' } },
     });
-    console.log(`✓ Push sent: ${title}`);
+    console.log(`✓ Push: ${title}`);
   } catch(e) { console.error('Push error:', e.message); }
 }
 
@@ -56,6 +56,7 @@ db.exec(`
     fib_level       TEXT,
     pattern         TEXT,
     note            TEXT,
+    strategy        TEXT DEFAULT 'FIB',
     rsi             REAL,
     atr             REAL,
     current_price   REAL,
@@ -77,56 +78,42 @@ db.exec(`
   );
 `);
 
-// ── Migrations — add outcome columns if old DB ──────────────────────────
+// ── Migrations ────────────────────────────────────────────
 try {
   const cols = db.prepare("PRAGMA table_info(signals)").all().map(c => c.name);
   if (!cols.includes('outcome'))    db.exec("ALTER TABLE signals ADD COLUMN outcome TEXT DEFAULT 'open'");
   if (!cols.includes('exit_price')) db.exec("ALTER TABLE signals ADD COLUMN exit_price REAL");
   if (!cols.includes('closed_at'))  db.exec("ALTER TABLE signals ADD COLUMN closed_at INTEGER");
   if (!cols.includes('pnl_r'))      db.exec("ALTER TABLE signals ADD COLUMN pnl_r REAL");
-  console.log('✓ Migrations applied');
+  if (!cols.includes('strategy'))   db.exec("ALTER TABLE signals ADD COLUMN strategy TEXT DEFAULT 'FIB'");
+  console.log('✓ Migrations OK');
 } catch(e) { console.error('Migration error:', e.message); }
 
-// ── CLEANUP on startup ──────────────────────────────────────────────────
+// ── Cleanup ────────────────────────────────────────────────
 try {
-  const del1D = db.prepare("DELETE FROM signals WHERE timeframe = '1D'").run();
-  console.log(`✓ Deleted ${del1D.changes} old 1D signals`);
-} catch(e) { console.error('Cleanup error:', e.message); }
-try {
-  const staleCut = Date.now() - 30*24*3600000;
-  const delStale = db.prepare("DELETE FROM signals WHERE timestamp < ?").run(staleCut);
-  console.log(`✓ Deleted ${delStale.changes} signals older than 30 days`);
+  db.prepare("DELETE FROM signals WHERE timeframe = '1D'").run();
+  db.prepare("DELETE FROM signals WHERE timestamp < ?").run(Date.now() - 30*24*3600000);
 } catch(e) {}
 
-// ── PRICE CACHE ─────────────────────────────────────────────────────────
+// ── PRICE CACHE ───────────────────────────────────────────
 let cachedPrice = { price: null, timestamp: 0 };
-const PRICE_CACHE_TTL = 30 * 1000;
-
-async function fetchLivePriceFromSource() {
+async function fetchLivePrice() {
   if (!TWELVE_API_KEY) return null;
   try {
-    const r = await axios.get(
-      `https://api.twelvedata.com/price?symbol=${encodeURIComponent(TICKER)}&apikey=${TWELVE_API_KEY}`,
-      { timeout: 5000 }
-    );
+    const r = await axios.get(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(TICKER)}&apikey=${TWELVE_API_KEY}`, { timeout: 5000 });
     const p = parseFloat(r.data?.price);
-    if (!isNaN(p) && p > 0) {
-      cachedPrice = { price: p, timestamp: Date.now() };
-      console.log(`✓ Price updated: $${p.toFixed(2)}`);
-      return p;
-    }
-    if (r.data?.code === 429) console.warn('⚠️ Twelve Data rate limit reached');
+    if (!isNaN(p) && p > 0) { cachedPrice = { price: p, timestamp: Date.now() }; return p; }
     return null;
   } catch(e) { return null; }
 }
-fetchLivePriceFromSource();
-setInterval(fetchLivePriceFromSource, PRICE_CACHE_TTL);
+fetchLivePrice();
+setInterval(fetchLivePrice, 30000);
 
-// ── CANDLE CACHE ────────────────────────────────────────────────────────
+// ── CANDLE CACHE ──────────────────────────────────────────
 const candleCache = {};
 const CANDLE_CACHE_TTL = 5 * 60 * 1000;
 
-async function fetchCandles(interval, outputsize=60) {
+async function fetchCandles(interval, outputsize=100) {
   const cacheKey = `${interval}_${outputsize}`;
   const cached = candleCache[cacheKey];
   if (cached && (Date.now() - cached.timestamp) < CANDLE_CACHE_TTL) return cached.data;
@@ -147,7 +134,7 @@ async function fetchCandles(interval, outputsize=60) {
 
 function generateMockCandles(count) {
   const candles = [];
-  const basePrice = cachedPrice.price || 3300;
+  const basePrice = cachedPrice.price || 4700;
   let price = basePrice + Math.random()*30;
   const now = Date.now();
   for (let i=count-1; i>=0; i--) {
@@ -159,7 +146,7 @@ function generateMockCandles(count) {
   return candles;
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────
 function timeAgo(date) {
   const s = Math.floor((new Date() - date) / 1000);
   if (s < 3600)  return `${Math.floor(s/60)}m ago`;
@@ -175,10 +162,31 @@ function calcEMA(values, period) {
   return ema;
 }
 
+function calcRSI(closes) {
+  let gains=0, losses=0;
+  for (let i=1; i<=14; i++) {
+    const diff = closes[i-1]-closes[i];
+    if (diff>0) gains+=diff; else losses-=diff;
+  }
+  return Math.round((100-100/(1+gains/14/(losses/14||0.001)))*10)/10;
+}
+
+function calcATR(candles) {
+  let atrSum=0;
+  for (let i=0; i<14; i++) {
+    atrSum += Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - (candles[i+1]?.close||candles[i].close)),
+      Math.abs(candles[i].low  - (candles[i+1]?.close||candles[i].close))
+    );
+  }
+  return Math.round((atrSum/14)*100)/100;
+}
+
 function calcBollingerBands(closes, period=20, std=2) {
   if (closes.length < period) return null;
   const slice = closes.slice(0, period);
-  const mean  = slice.reduce((a,b) => a+b, 0) / period;
+  const mean = slice.reduce((a,b) => a+b, 0) / period;
   const variance = slice.reduce((a,b) => a + Math.pow(b-mean,2), 0) / period;
   const s = Math.sqrt(variance);
   return { upper: mean+std*s, middle: mean, lower: mean-std*s };
@@ -198,192 +206,329 @@ function isMarketClosed() {
   return day === 6 || day === 0 || (day === 5 && hour >= 21) || (day === 1 && hour < 1);
 }
 
-// ── Confluence Score ───────────────────────────────────────────────────
-function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
-  let score = 0;
-  const reasons = [];
-  const closes = candles.map(c => c.close);
-  const price  = closes[0];
-
-  const fibScores = { '61.8%':25, '50.0%':20, '38.2%':18, '78.6%':15, '23.6%':10 };
-  const fibScore  = fibScores[fibLevel] || 10;
-  score += fibScore;
-  reasons.push(`FIB ${fibLevel}: +${fibScore}pts`);
-
-  let rsiScore = 0;
-  if (action === 'BUY') {
-    if (rsi >= 25 && rsi <= 45)      { rsiScore=20; reasons.push('RSI oversold: +20pts'); }
-    else if (rsi >= 45 && rsi <= 55) { rsiScore=10; reasons.push('RSI neutral: +10pts'); }
-    else if (rsi < 25)               { rsiScore=15; reasons.push('RSI extreme oversold: +15pts'); }
-    else                             { rsiScore=0;  reasons.push('RSI too high for BUY: +0pts'); }
-  } else {
-    if (rsi >= 55 && rsi <= 75)      { rsiScore=20; reasons.push('RSI overbought: +20pts'); }
-    else if (rsi >= 45 && rsi <= 55) { rsiScore=10; reasons.push('RSI neutral: +10pts'); }
-    else if (rsi > 75)               { rsiScore=15; reasons.push('RSI extreme overbought: +15pts'); }
-    else                             { rsiScore=0;  reasons.push('RSI too low for SELL: +0pts'); }
-  }
-  score += rsiScore;
-
-  const ema20  = calcEMA(closes, Math.min(20, closes.length-1));
-  const ema50  = calcEMA(closes, Math.min(50, closes.length-1));
-  const ema200 = calcEMA(closes, Math.min(200, closes.length-1));
-
-  const uptrend   = ema50 && ema200 && ema50 > ema200;
-  const downtrend = ema50 && ema200 && ema50 < ema200;
-
-  let emaScore = 0;
-  if (action === 'BUY') {
-    if (!uptrend) { emaScore = -10; reasons.push('Counter-trend BUY: -10pts'); }
-    else {
-      if (price > ema20)  emaScore += 8;
-      if (price > ema50)  emaScore += 7;
-      if (price > ema200) emaScore += 5;
-      reasons.push(`Uptrend confirmed: +${emaScore}pts`);
-    }
-  } else {
-    if (!downtrend) { emaScore = -10; reasons.push('Counter-trend SELL: -10pts'); }
-    else {
-      if (price < ema20)  emaScore += 8;
-      if (price < ema50)  emaScore += 7;
-      if (price < ema200) emaScore += 5;
-      reasons.push(`Downtrend confirmed: +${emaScore}pts`);
-    }
-  }
-  score += emaScore;
-
-  const bb = calcBollingerBands(closes);
-  let bbScore = 0;
-  if (bb) {
-    if      (action==='BUY'  && price<=bb.lower)  { bbScore=15; reasons.push('Price at BB lower: +15pts'); }
-    else if (action==='SELL' && price>=bb.upper)  { bbScore=15; reasons.push('Price at BB upper: +15pts'); }
-    else if (action==='BUY'  && price<=bb.middle) { bbScore=8;  reasons.push('Price below BB mid: +8pts'); }
-    else if (action==='SELL' && price>=bb.middle) { bbScore=8;  reasons.push('Price above BB mid: +8pts'); }
-  }
-  score += bbScore;
-
+function detectPattern(candles, action) {
   const c0=candles[0], c1=candles[1];
   const body0  = Math.abs(c0.close-c0.open);
   const range0 = c0.high-c0.low;
   const upper0 = c0.high - Math.max(c0.close,c0.open);
   const lower0 = Math.min(c0.close,c0.open) - c0.low;
 
-  let patternScore=0, patternName='No pattern';
-  if      (action==='BUY'  && c0.close>c0.open && c0.close>c1.open && c0.open<c1.close) { patternScore=20; patternName='Bullish Engulfing'; }
-  else if (action==='SELL' && c0.close<c0.open && c0.close<c1.close && c0.open>c1.open) { patternScore=20; patternName='Bearish Engulfing'; }
-  else if (action==='BUY'  && lower0>body0*2.5 && lower0>upper0*2)                      { patternScore=18; patternName='Bullish Pin Bar'; }
-  else if (action==='SELL' && upper0>body0*2.5 && upper0>lower0*2)                      { patternScore=18; patternName='Bearish Pin Bar'; }
-  else if (range0>0 && body0/range0<0.25)                                                { patternScore=12; patternName='Doji'; }
-  else if (c0.high<c1.high && c0.low>c1.low)                                            { patternScore=10; patternName='Inside Bar'; }
-
-  score += patternScore;
-  reasons.push(`${patternName}: +${patternScore}pts`);
-
-  return { score: Math.min(Math.round(score), 100), reasons, patternName };
+  if (action==='BUY' && c0.close>c0.open && c0.close>c1.open && c0.open<c1.close) return { score: 20, name: 'Bullish Engulfing' };
+  if (action==='SELL' && c0.close<c0.open && c0.close<c1.close && c0.open>c1.open) return { score: 20, name: 'Bearish Engulfing' };
+  if (action==='BUY' && lower0>body0*2.5 && lower0>upper0*2) return { score: 18, name: 'Bullish Pin Bar' };
+  if (action==='SELL' && upper0>body0*2.5 && upper0>lower0*2) return { score: 18, name: 'Bearish Pin Bar' };
+  if (range0>0 && body0/range0<0.25) return { score: 12, name: 'Doji' };
+  if (c0.high<c1.high && c0.low>c1.low) return { score: 10, name: 'Inside Bar' };
+  return { score: 0, name: 'No pattern' };
 }
 
-// ── OUTCOME TRACKER — real TP/SL hit detection ──────────────────────────
-async function trackSignalOutcomes() {
-  try {
-    // Find all open signals
-    const openSignals = db.prepare("SELECT * FROM signals WHERE outcome = 'open' OR outcome IS NULL").all();
-    if (openSignals.length === 0) return;
+// ════════════════════════════════════════════════════════════════════════
+// STRATEGY 1: FIB PULLBACK (Trend markets)
+// ════════════════════════════════════════════════════════════════════════
+function scanFibPullback(candles, tf) {
+  const closes = candles.map(c => c.close);
+  const price = closes[0];
+  const rsi = calcRSI(closes);
+  const atr = calcATR(candles);
 
-    console.log(`🔍 Tracking ${openSignals.length} open signals...`);
+  const ema50 = calcEMA(closes, 50);
+  const ema200 = calcEMA(closes, 200);
+  const uptrend = ema50 && ema200 && ema50 > ema200;
+  const downtrend = ema50 && ema200 && ema50 < ema200;
 
-    // Fetch recent candles once for all checks (5m interval = granular enough)
-    const candles = await fetchCandles('5min', 100);
-    if (!candles || candles.length < 5) {
-      console.log('⚠️ No candles available for outcome tracking');
-      return;
+  // Only run in trending markets
+  if (!uptrend && !downtrend) return [];
+
+  let swingHigh=-Infinity, swingLow=Infinity;
+  for (let i=0; i<30; i++) {
+    if (candles[i].high > swingHigh) swingHigh = candles[i].high;
+    if (candles[i].low  < swingLow)  swingLow = candles[i].low;
+  }
+  const fibRange = swingHigh - swingLow;
+
+  const fibs = {
+    '61.8%': swingHigh - fibRange*0.618,
+    '50.0%': swingHigh - fibRange*0.500,
+    '38.2%': swingHigh - fibRange*0.382,
+    '78.6%': swingHigh - fibRange*0.786,
+  };
+
+  const signals = [];
+
+  for (const [fibName, fibValue] of Object.entries(fibs)) {
+    const tolerance = atr * 1.5;
+    if (Math.abs(price - fibValue) > tolerance) continue;
+
+    const action = uptrend ? 'BUY' : 'SELL';
+    const isBuyZone  = price < swingLow  + fibRange * 0.45;
+    const isSellZone = price > swingHigh - fibRange * 0.45;
+    if (action==='BUY'  && !isBuyZone)  continue;
+    if (action==='SELL' && !isSellZone) continue;
+
+    // Scoring
+    let score = 0;
+    const reasons = [];
+
+    const fibScores = { '61.8%':25, '50.0%':20, '38.2%':18, '78.6%':15 };
+    score += fibScores[fibName] || 10;
+    reasons.push(`FIB ${fibName}: +${fibScores[fibName]||10}pts`);
+
+    if (action==='BUY' && rsi >= 25 && rsi <= 50) { score += 20; reasons.push('RSI oversold: +20pts'); }
+    else if (action==='SELL' && rsi >= 50 && rsi <= 75) { score += 20; reasons.push('RSI overbought: +20pts'); }
+    else { score += 5; reasons.push(`RSI neutral: +5pts`); }
+
+    // Trend confirmation
+    if (action==='BUY' && price > ema50) { score += 15; reasons.push('Above EMA50: +15pts'); }
+    if (action==='SELL' && price < ema50) { score += 15; reasons.push('Below EMA50: +15pts'); }
+
+    // Pattern
+    const pattern = detectPattern(candles, action);
+    score += pattern.score;
+    if (pattern.score > 0) reasons.push(`${pattern.name}: +${pattern.score}pts`);
+
+    // SL/TP
+    let sl, tp1, tp2;
+    if (action==='BUY') {
+      sl  = Math.round((fibValue - atr*1.5)*100)/100;
+      tp1 = Math.round((price + atr*3.0)*100)/100;
+      tp2 = Math.round((price + atr*5.0)*100)/100;
+    } else {
+      sl  = Math.round((fibValue + atr*1.5)*100)/100;
+      tp1 = Math.round((price - atr*3.0)*100)/100;
+      tp2 = Math.round((price - atr*5.0)*100)/100;
     }
 
-    // Sort oldest → newest for scanning
-    const sortedCandles = [...candles].sort((a, b) => a.timestamp - b.timestamp);
+    const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+    if (rr < 2.0) continue;
 
-    let closedCount = 0;
+    signals.push({
+      action, price: Math.round(price*100)/100,
+      sl, tp1, tp2,
+      confidence: Math.min(Math.round(score), 100),
+      fib_level: fibName,
+      pattern: pattern.name,
+      strategy: 'FIB',
+      note: reasons.slice(0,3).join(' | '),
+      rsi, atr,
+    });
+  }
 
-    for (const signal of openSignals) {
-      try {
-        // Only check candles AFTER signal timestamp
-        const relevantCandles = sortedCandles.filter(c => c.timestamp > signal.timestamp);
-        if (relevantCandles.length === 0) continue;
+  return signals;
+}
 
-        const isBuy = signal.action === 'BUY';
-        const entry = signal.price;
-        const sl    = signal.sl;
-        const tp1   = signal.tp1;
-        const tp2   = signal.tp2;
+// ════════════════════════════════════════════════════════════════════════
+// STRATEGY 2: RANGE BOUNCE (Sideways markets)
+// ════════════════════════════════════════════════════════════════════════
+function scanRangeBounce(candles, tf) {
+  const closes = candles.map(c => c.close);
+  const price = closes[0];
+  const rsi = calcRSI(closes);
+  const atr = calcATR(candles);
 
-        if (!sl || !tp1) continue;
+  const ema50 = calcEMA(closes, 50);
+  const ema200 = calcEMA(closes, 200);
+  
+  // Range = EMA50 close to EMA200 (no strong trend)
+  if (!ema50 || !ema200) return [];
+  const emaDiff = Math.abs(ema50 - ema200) / ema200;
+  if (emaDiff > 0.02) return []; // > 2% difference = too trendy, skip
 
-        let outcome = null;
-        let exitPrice = null;
-        let exitTime = null;
-        let pnlR = null;
+  // Find range high/low
+  let rangeHigh=-Infinity, rangeLow=Infinity;
+  for (let i=0; i<50; i++) {
+    if (!candles[i]) break;
+    if (candles[i].high > rangeHigh) rangeHigh = candles[i].high;
+    if (candles[i].low  < rangeLow)  rangeLow = candles[i].low;
+  }
+  const rangeSize = rangeHigh - rangeLow;
+  if (rangeSize < atr * 3) return []; // range too small
 
-        // Scan candles in order — first one to hit SL or TP wins
-        for (const c of relevantCandles) {
-          if (isBuy) {
-            // BUY: SL below, TP above
-            if (c.low <= sl)  { outcome='sl_hit';  exitPrice=sl;  exitTime=c.timestamp; break; }
-            if (c.high >= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
-            if (c.high >= tp1){ outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
-          } else {
-            // SELL: SL above, TP below
-            if (c.high >= sl) { outcome='sl_hit';  exitPrice=sl;  exitTime=c.timestamp; break; }
-            if (c.low <= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
-            if (c.low <= tp1) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
-          }
-        }
+  const bb = calcBollingerBands(closes);
+  if (!bb) return [];
 
-        // Expired check — signal older than 48h and no hit → mark expired
-        if (!outcome) {
-          const ageHours = (Date.now() - signal.timestamp) / 3600000;
-          if (ageHours > 48) {
-            outcome = 'expired';
-            // Close at current price if available
-            const lastCandle = relevantCandles[relevantCandles.length - 1];
-            exitPrice = lastCandle ? lastCandle.close : entry;
-            exitTime = lastCandle ? lastCandle.timestamp : Date.now();
-          }
-        }
+  const signals = [];
 
-        if (outcome) {
-          // Calculate PnL in R units (1R = risk to SL)
-          const risk = Math.abs(entry - sl);
-          const profit = isBuy ? (exitPrice - entry) : (entry - exitPrice);
-          pnlR = risk > 0 ? profit / risk : 0;
+  // BUY near range low OR BB lower
+  const nearLow = price < rangeLow + rangeSize * 0.25;
+  const atBBLower = price <= bb.lower * 1.005;
 
-          db.prepare(`UPDATE signals SET outcome=?, exit_price=?, closed_at=?, pnl_r=? WHERE id=?`)
-            .run(outcome, exitPrice, exitTime, Math.round(pnlR * 100) / 100, signal.id);
+  if (nearLow && atBBLower && rsi < 45) {
+    let score = 30; // base
+    const reasons = ['Range Low Bounce: +30pts'];
+    
+    if (rsi < 30) { score += 20; reasons.push('RSI extreme oversold: +20pts'); }
+    else if (rsi < 40) { score += 15; reasons.push('RSI oversold: +15pts'); }
 
-          console.log(`✓ Signal #${signal.id} ${signal.action} closed: ${outcome} @ ${exitPrice.toFixed(2)} (${pnlR >= 0 ? '+' : ''}${pnlR.toFixed(2)}R)`);
-          closedCount++;
-        }
-      } catch(e) {
-        console.error(`Tracker error for signal #${signal.id}:`, e.message);
+    const pattern = detectPattern(candles, 'BUY');
+    score += pattern.score;
+    if (pattern.score > 0) reasons.push(`${pattern.name}: +${pattern.score}pts`);
+
+    const sl = Math.round((rangeLow - atr*1.5)*100)/100;
+    const tp1 = Math.round((rangeHigh - rangeSize*0.3)*100)/100;
+    const tp2 = Math.round((rangeHigh - rangeSize*0.15)*100)/100;
+    const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+
+    if (rr >= 1.8 && score >= 60) {
+      signals.push({
+        action: 'BUY', price: Math.round(price*100)/100,
+        sl, tp1, tp2,
+        confidence: Math.min(Math.round(score), 100),
+        fib_level: null,
+        pattern: pattern.name,
+        strategy: 'Range Bounce',
+        note: reasons.slice(0,3).join(' | '),
+        rsi, atr,
+      });
+    }
+  }
+
+  // SELL near range high OR BB upper
+  const nearHigh = price > rangeHigh - rangeSize * 0.25;
+  const atBBUpper = price >= bb.upper * 0.995;
+
+  if (nearHigh && atBBUpper && rsi > 55) {
+    let score = 30;
+    const reasons = ['Range High Rejection: +30pts'];
+
+    if (rsi > 70) { score += 20; reasons.push('RSI extreme overbought: +20pts'); }
+    else if (rsi > 60) { score += 15; reasons.push('RSI overbought: +15pts'); }
+
+    const pattern = detectPattern(candles, 'SELL');
+    score += pattern.score;
+    if (pattern.score > 0) reasons.push(`${pattern.name}: +${pattern.score}pts`);
+
+    const sl = Math.round((rangeHigh + atr*1.5)*100)/100;
+    const tp1 = Math.round((rangeLow + rangeSize*0.3)*100)/100;
+    const tp2 = Math.round((rangeLow + rangeSize*0.15)*100)/100;
+    const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+
+    if (rr >= 1.8 && score >= 60) {
+      signals.push({
+        action: 'SELL', price: Math.round(price*100)/100,
+        sl, tp1, tp2,
+        confidence: Math.min(Math.round(score), 100),
+        fib_level: null,
+        pattern: pattern.name,
+        strategy: 'Range Bounce',
+        note: reasons.slice(0,3).join(' | '),
+        rsi, atr,
+      });
+    }
+  }
+
+  return signals;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// STRATEGY 3: BREAKOUT (Momentum)
+// ════════════════════════════════════════════════════════════════════════
+function scanBreakout(candles, tf) {
+  const closes = candles.map(c => c.close);
+  const price = closes[0];
+  const rsi = calcRSI(closes);
+  const atr = calcATR(candles);
+
+  // Find consolidation high/low from candles 2-20
+  let consHigh=-Infinity, consLow=Infinity;
+  for (let i=2; i<22; i++) {
+    if (!candles[i]) break;
+    if (candles[i].high > consHigh) consHigh = candles[i].high;
+    if (candles[i].low  < consLow)  consLow = candles[i].low;
+  }
+  const consRange = consHigh - consLow;
+  if (consRange < atr * 2) return []; // consolidation too tight
+
+  const signals = [];
+
+  // BULLISH BREAKOUT — price broke above consHigh
+  if (price > consHigh && candles[0].close > candles[0].open) {
+    const breakoutSize = price - consHigh;
+    if (breakoutSize > atr * 0.3 && breakoutSize < atr * 3) {
+      let score = 35;
+      const reasons = ['Bullish Breakout: +35pts'];
+
+      // Volume check via candle body
+      const body = Math.abs(candles[0].close - candles[0].open);
+      const range = candles[0].high - candles[0].low;
+      if (range > 0 && body/range > 0.7) { score += 15; reasons.push('Strong breakout candle: +15pts'); }
+
+      if (rsi > 50 && rsi < 70) { score += 15; reasons.push('RSI bullish: +15pts'); }
+
+      const pattern = detectPattern(candles, 'BUY');
+      if (pattern.score > 0) { score += pattern.score; reasons.push(`${pattern.name}: +${pattern.score}pts`); }
+
+      const sl = Math.round((consHigh - atr*0.5)*100)/100;
+      const tp1 = Math.round((price + consRange*0.75)*100)/100;
+      const tp2 = Math.round((price + consRange*1.5)*100)/100;
+      const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+
+      if (rr >= 1.5 && score >= 60) {
+        signals.push({
+          action: 'BUY', price: Math.round(price*100)/100,
+          sl, tp1, tp2,
+          confidence: Math.min(Math.round(score), 100),
+          fib_level: null,
+          pattern: pattern.name,
+          strategy: 'Breakout',
+          note: reasons.slice(0,3).join(' | '),
+          rsi, atr,
+        });
       }
     }
-
-    if (closedCount > 0) console.log(`✓ Closed ${closedCount} signals this cycle`);
-  } catch(e) {
-    console.error('Outcome tracker error:', e.message);
   }
+
+  // BEARISH BREAKDOWN
+  if (price < consLow && candles[0].close < candles[0].open) {
+    const breakdownSize = consLow - price;
+    if (breakdownSize > atr * 0.3 && breakdownSize < atr * 3) {
+      let score = 35;
+      const reasons = ['Bearish Breakdown: +35pts'];
+
+      const body = Math.abs(candles[0].close - candles[0].open);
+      const range = candles[0].high - candles[0].low;
+      if (range > 0 && body/range > 0.7) { score += 15; reasons.push('Strong breakdown candle: +15pts'); }
+
+      if (rsi < 50 && rsi > 30) { score += 15; reasons.push('RSI bearish: +15pts'); }
+
+      const pattern = detectPattern(candles, 'SELL');
+      if (pattern.score > 0) { score += pattern.score; reasons.push(`${pattern.name}: +${pattern.score}pts`); }
+
+      const sl = Math.round((consLow + atr*0.5)*100)/100;
+      const tp1 = Math.round((price - consRange*0.75)*100)/100;
+      const tp2 = Math.round((price - consRange*1.5)*100)/100;
+      const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+
+      if (rr >= 1.5 && score >= 60) {
+        signals.push({
+          action: 'SELL', price: Math.round(price*100)/100,
+          sl, tp1, tp2,
+          confidence: Math.min(Math.round(score), 100),
+          fib_level: null,
+          pattern: pattern.name,
+          strategy: 'Breakout',
+          note: reasons.slice(0,3).join(' | '),
+          rsi, atr,
+        });
+      }
+    }
+  }
+
+  return signals;
 }
 
-// Run outcome tracker every 15 minutes
-trackSignalOutcomes();
-setInterval(trackSignalOutcomes, 15 * 60 * 1000);
-
-// ── MAIN SCANNER ──────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════
+// MAIN SCANNER — runs all strategies on all timeframes
+// ════════════════════════════════════════════════════════════════════════
 async function scanForSignals() {
   if (isMarketClosed()) { console.log('Market closed'); return; }
-  if (isEconomicEventSoon(30)) { console.log('⚠️ Economic event block'); return; }
+  if (isEconomicEventSoon(30)) { console.log('⚠️ Economic event'); return; }
   if (!cachedPrice.price) { console.log('⚠️ No live price'); return; }
 
   const timeframes = [
-    { label:'1H', interval:'1h', validFor:2, minScore:75 },
-    { label:'4H', interval:'4h', validFor:8, minScore:73 },
+    { label: '15m', interval: '15min', validFor: 0.5, minScore: 70 },
+    { label: '30m', interval: '30min', validFor: 1,   minScore: 72 },
+    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 75 },
+    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 73 },
   ];
 
   for (const tf of timeframes) {
@@ -391,126 +536,118 @@ async function scanForSignals() {
       const candles = await fetchCandles(tf.interval, 220);
       if (!candles || candles.length < 30) continue;
 
-      const closes = candles.map(c => c.close);
-      const price  = closes[0];
+      const price = candles[0].close;
 
-      // Deviation check
+      // Deviation check against live price
       if (cachedPrice.price) {
         const dev = Math.abs(price - cachedPrice.price) / cachedPrice.price;
-        if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles — skipping`); continue; }
+        if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles`); continue; }
       }
 
-      const ema50  = calcEMA(closes, Math.min(50, closes.length-1));
-      const ema200 = calcEMA(closes, Math.min(200, closes.length-1));
-      const masterUptrend   = ema50 && ema200 && ema50 > ema200;
-      const masterDowntrend = ema50 && ema200 && ema50 < ema200;
+      // Run all 3 strategies
+      const fibSignals    = scanFibPullback(candles, tf);
+      const rangeSignals  = scanRangeBounce(candles, tf);
+      const breakoutSigs  = scanBreakout(candles, tf);
+      const allSignals    = [...fibSignals, ...rangeSignals, ...breakoutSigs];
 
-      console.log(`[${tf.label}] $${price.toFixed(2)} Trend:${masterUptrend?'UP':masterDowntrend?'DOWN':'NEUTRAL'}`);
+      for (const sig of allSignals) {
+        // Filter by minimum confidence
+        if (sig.confidence < tf.minScore) continue;
 
-      let swingHigh=-Infinity, swingLow=Infinity;
-      for (let i=0; i<30; i++) {
-        if (candles[i].high > swingHigh) swingHigh=candles[i].high;
-        if (candles[i].low  < swingLow)  swingLow=candles[i].low;
+        // Dedup check — no same action/strategy/TF in last 2h
+        const recent = db.prepare(
+          `SELECT id FROM signals WHERE ticker=? AND action=? AND strategy=? AND timeframe=? AND timestamp > ?`
+        ).get(TICKER, sig.action, sig.strategy, tf.label, Date.now()-2*3600000);
+        if (recent) continue;
+
+        const record = {
+          ticker: TICKER,
+          ...sig,
+          timeframe: tf.label,
+          current_price: sig.price,
+          entry_valid_for: tf.validFor,
+          mtf: JSON.stringify({ h1: tf.label==='1H', h4: tf.label==='4H', d1: false }),
+          timestamp: Date.now(),
+        };
+
+        db.prepare(`INSERT INTO signals
+          (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
+          VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
+        `).run(record);
+
+        console.log(`✓ [${sig.strategy}] ${sig.action} ${TICKER} @ ${sig.price} (${tf.label}, ${sig.confidence}%)`);
+        const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
+        sendSignalPush({ ...record, id: inserted.id });
       }
-      const fibRange = swingHigh - swingLow;
-
-      const fibs = {
-        '61.8%': swingHigh - fibRange*0.618,
-        '50.0%': swingHigh - fibRange*0.500,
-        '38.2%': swingHigh - fibRange*0.382,
-        '78.6%': swingHigh - fibRange*0.786,
-      };
-
-      let atrSum=0;
-      for (let i=0; i<14; i++) {
-        atrSum += Math.max(
-          candles[i].high - candles[i].low,
-          Math.abs(candles[i].high - (candles[i+1]?.close||candles[i].close)),
-          Math.abs(candles[i].low  - (candles[i+1]?.close||candles[i].close))
-        );
-      }
-      const atr = Math.round((atrSum/14)*100)/100;
-
-      let gains=0, losses=0;
-      for (let i=1; i<=14; i++) {
-        const diff = closes[i-1]-closes[i];
-        if (diff>0) gains+=diff; else losses-=diff;
-      }
-      const rsi = Math.round((100-100/(1+gains/14/(losses/14||0.001)))*10)/10;
-
-      for (const [fibName, fibValue] of Object.entries(fibs)) {
-        const tolerance = atr * 2.0;
-        if (Math.abs(price - fibValue) > tolerance) continue;
-
-        const isBuyZone  = price < swingLow  + fibRange * 0.45;
-        const isSellZone = price > swingHigh - fibRange * 0.45;
-
-        for (const action of ['BUY', 'SELL']) {
-          if (action==='BUY'  && !isBuyZone)  continue;
-          if (action==='SELL' && !isSellZone) continue;
-          if (action==='BUY'  && masterDowntrend) continue;
-          if (action==='SELL' && masterUptrend) continue;
-
-          const confluence = calcConfluenceScore(candles, action, fibName, atr, rsi);
-          if (confluence.score < tf.minScore) continue;
-
-          const recent = db.prepare(
-            `SELECT id FROM signals WHERE ticker=? AND action=? AND fib_level=? AND timeframe=? AND timestamp > ?`
-          ).get(TICKER, action, fibName, tf.label, Date.now()-2*3600000);
-          if (recent) continue;
-
-          let sl, tp1, tp2;
-          const fibSorted = Object.values(fibs).sort((a,b)=>a-b);
-          if (action==='BUY') {
-            const nextDown = fibSorted.filter(f=>f<fibValue).pop() || swingLow - atr;
-            sl  = Math.round((nextDown - atr*1.5)*100)/100;
-            tp1 = Math.round((fibValue + atr*3.0)*100)/100;
-            tp2 = Math.round((fibValue + atr*5.0)*100)/100;
-          } else {
-            const nextUp = fibSorted.filter(f=>f>fibValue).shift() || swingHigh + atr;
-            sl  = Math.round((nextUp   + atr*1.5)*100)/100;
-            tp1 = Math.round((fibValue - atr*3.0)*100)/100;
-            tp2 = Math.round((fibValue - atr*5.0)*100)/100;
-          }
-
-          const risk = Math.abs(price - sl);
-          const reward = Math.abs(tp1 - price);
-          const rr = risk > 0 ? reward / risk : 0;
-          if (rr < 2.0) continue;
-
-          const signal = {
-            ticker: TICKER, action,
-            price: Math.round(price*100)/100,
-            sl, tp1, tp2,
-            timeframe: tf.label,
-            confidence: confluence.score,
-            fib_level: fibName,
-            pattern: confluence.patternName,
-            note: confluence.reasons.slice(0,3).join(' | '),
-            rsi: Math.round(rsi*10)/10,
-            atr,
-            current_price: Math.round(price*100)/100,
-            entry_valid_for: tf.validFor,
-            mtf: JSON.stringify({ h1:tf.label==='1H', h4:tf.label==='4H', d1:false }),
-            timestamp: Date.now(),
-          };
-
-          db.prepare(`INSERT INTO signals
-            (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
-            VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
-          `).run(signal);
-
-          console.log(`✓ ${action} ${TICKER} @ ${price} (${tf.label}, ${fibName}, ${confluence.score}%)`);
-          const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
-          sendSignalPush({ ...signal, id: inserted.id });
-        }
-      }
-    } catch(err) { console.error(`Scanner error ${tf.label}:`, err.message); }
+    } catch(err) {
+      console.error(`Scanner error ${tf.label}:`, err.message);
+    }
   }
 }
 
-// ── Routes ────────────────────────────────────────────────────────────
-app.get('/',       (req,res) => res.json({ status:'Pulstrade Backend', version:'3.3.0-tracking' }));
+// ── OUTCOME TRACKER ───────────────────────────────────────
+async function trackSignalOutcomes() {
+  try {
+    const openSignals = db.prepare("SELECT * FROM signals WHERE outcome = 'open' OR outcome IS NULL").all();
+    if (openSignals.length === 0) return;
+
+    const candles = await fetchCandles('5min', 100);
+    if (!candles || candles.length < 5) return;
+
+    const sortedCandles = [...candles].sort((a, b) => a.timestamp - b.timestamp);
+    let closedCount = 0;
+
+    for (const signal of openSignals) {
+      try {
+        const relevantCandles = sortedCandles.filter(c => c.timestamp > signal.timestamp);
+        if (relevantCandles.length === 0) continue;
+
+        const isBuy = signal.action === 'BUY';
+        const sl = signal.sl, tp1 = signal.tp1, tp2 = signal.tp2;
+        if (!sl || !tp1) continue;
+
+        let outcome = null, exitPrice = null, exitTime = null;
+
+        for (const c of relevantCandles) {
+          if (isBuy) {
+            if (c.low <= sl) { outcome='sl_hit'; exitPrice=sl; exitTime=c.timestamp; break; }
+            if (c.high >= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
+            if (c.high >= tp1) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
+          } else {
+            if (c.high >= sl) { outcome='sl_hit'; exitPrice=sl; exitTime=c.timestamp; break; }
+            if (c.low <= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
+            if (c.low <= tp1) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
+          }
+        }
+
+        if (!outcome) {
+          const ageHours = (Date.now() - signal.timestamp) / 3600000;
+          if (ageHours > 48) {
+            outcome = 'expired';
+            const last = relevantCandles[relevantCandles.length - 1];
+            exitPrice = last ? last.close : signal.price;
+            exitTime = last ? last.timestamp : Date.now();
+          }
+        }
+
+        if (outcome) {
+          const risk = Math.abs(signal.price - sl);
+          const profit = isBuy ? (exitPrice - signal.price) : (signal.price - exitPrice);
+          const pnlR = risk > 0 ? profit / risk : 0;
+          db.prepare(`UPDATE signals SET outcome=?, exit_price=?, closed_at=?, pnl_r=? WHERE id=?`)
+            .run(outcome, exitPrice, exitTime, Math.round(pnlR * 100) / 100, signal.id);
+          closedCount++;
+        }
+      } catch(e) {}
+    }
+    if (closedCount > 0) console.log(`✓ Closed ${closedCount} signals`);
+  } catch(e) { console.error('Tracker error:', e.message); }
+}
+trackSignalOutcomes();
+setInterval(trackSignalOutcomes, 15 * 60 * 1000);
+
+// ── Routes ─────────────────────────────────────────────────
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.0.0-multistrat' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -518,7 +655,8 @@ app.get('/health', (req,res) => res.json({
   closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
   marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
-  cacheAge: cachedPrice.timestamp ? Math.floor((Date.now()-cachedPrice.timestamp)/1000) + 's' : 'none',
+  strategies: ['FIB', 'Range Bounce', 'Breakout'],
+  timeframes: ['15m', '30m', '1H', '4H'],
 }));
 
 app.get('/signals', (req,res) => {
@@ -536,7 +674,6 @@ app.get('/signals/:id', (req,res) => {
   res.json({...row, mtf:row.mtf?JSON.parse(row.mtf):null});
 });
 
-// ── /stats — REAL statistics from actual outcomes ─────────────────────
 app.get('/stats', (req, res) => {
   try {
     const all = db.prepare("SELECT * FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").all();
@@ -547,48 +684,48 @@ app.get('/stats', (req, res) => {
         totalSignals: db.prepare("SELECT COUNT(*) as c FROM signals").get().c,
         closedSignals: 0,
         openSignals: db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome='open' OR outcome IS NULL").get().c,
-        winRate: null,
-        avgRR: null,
-        profitFactor: null,
-        totalPnL: null,
-        bestTrade: null,
-        worstTrade: null,
+        winRate: null, avgRR: null, profitFactor: null,
         wins: 0, losses: 0, expired: 0,
         fibPerformance: {},
-        message: 'Not enough closed trades yet. Stats will appear after signals close.',
+        strategyPerformance: {},
       });
     }
 
     const wins = all.filter(s => s.outcome === 'tp1_hit' || s.outcome === 'tp2_hit');
     const losses = all.filter(s => s.outcome === 'sl_hit');
     const expired = all.filter(s => s.outcome === 'expired');
-    
-    const decisiveClosed = wins.length + losses.length; // exclude expired from win rate
-    const winRate = decisiveClosed > 0 ? (wins.length / decisiveClosed) * 100 : 0;
+    const decisive = wins.length + losses.length;
+    const winRate = decisive > 0 ? (wins.length / decisive) * 100 : 0;
     
     const allPnL = all.map(s => s.pnl_r || 0);
     const totalPnL = allPnL.reduce((a,b) => a+b, 0);
     const avgRR = all.length > 0 ? totalPnL / all.length : 0;
-    
     const grossWin = wins.reduce((a,s) => a + (s.pnl_r || 0), 0);
     const grossLoss = Math.abs(losses.reduce((a,s) => a + (s.pnl_r || 0), 0));
     const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin;
-    
-    const bestTrade = allPnL.length > 0 ? Math.max(...allPnL) : 0;
-    const worstTrade = allPnL.length > 0 ? Math.min(...allPnL) : 0;
-    
-    // FIB performance breakdown
+
     const fibPerformance = {};
     for (const level of ['61.8%', '50.0%', '38.2%', '78.6%', '23.6%']) {
       const atLevel = all.filter(s => s.fib_level === level);
-      const winsAtLevel = atLevel.filter(s => s.outcome === 'tp1_hit' || s.outcome === 'tp2_hit');
-      const lossesAtLevel = atLevel.filter(s => s.outcome === 'sl_hit');
-      const decisive = winsAtLevel.length + lossesAtLevel.length;
+      const winsAt = atLevel.filter(s => s.outcome === 'tp1_hit' || s.outcome === 'tp2_hit');
+      const lossesAt = atLevel.filter(s => s.outcome === 'sl_hit');
+      const decisiveAt = winsAt.length + lossesAt.length;
       fibPerformance[level] = {
-        total: atLevel.length,
-        wins: winsAtLevel.length,
-        losses: lossesAtLevel.length,
-        winRate: decisive > 0 ? Math.round((winsAtLevel.length / decisive) * 1000) / 10 : null,
+        total: atLevel.length, wins: winsAt.length, losses: lossesAt.length,
+        winRate: decisiveAt > 0 ? Math.round((winsAt.length / decisiveAt) * 1000) / 10 : null,
+      };
+    }
+
+    const strategyPerformance = {};
+    for (const strat of ['FIB', 'Range Bounce', 'Breakout']) {
+      const ofStrat = all.filter(s => s.strategy === strat);
+      const winsS = ofStrat.filter(s => s.outcome === 'tp1_hit' || s.outcome === 'tp2_hit');
+      const lossesS = ofStrat.filter(s => s.outcome === 'sl_hit');
+      const decisiveS = winsS.length + lossesS.length;
+      strategyPerformance[strat] = {
+        total: ofStrat.length, wins: winsS.length, losses: lossesS.length,
+        winRate: decisiveS > 0 ? Math.round((winsS.length / decisiveS) * 1000) / 10 : null,
+        avgPnL: ofStrat.length > 0 ? Math.round((ofStrat.reduce((a,s) => a+(s.pnl_r||0),0) / ofStrat.length) * 100) / 100 : null,
       };
     }
 
@@ -600,28 +737,19 @@ app.get('/stats', (req, res) => {
       avgRR: Math.round(avgRR * 100) / 100,
       profitFactor: Math.round(profitFactor * 100) / 100,
       totalPnL: Math.round(totalPnL * 100) / 100,
-      bestTrade: Math.round(bestTrade * 100) / 100,
-      worstTrade: Math.round(worstTrade * 100) / 100,
-      wins: wins.length,
-      losses: losses.length,
-      expired: expired.length,
-      fibPerformance,
+      bestTrade: allPnL.length > 0 ? Math.round(Math.max(...allPnL) * 100) / 100 : 0,
+      worstTrade: allPnL.length > 0 ? Math.round(Math.min(...allPnL) * 100) / 100 : 0,
+      wins: wins.length, losses: losses.length, expired: expired.length,
+      fibPerformance, strategyPerformance,
     });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/price', (req,res) => {
   if (cachedPrice.price) {
-    return res.json({
-      price: cachedPrice.price,
-      ticker: TICKER,
-      cached: true,
-      age: Math.floor((Date.now()-cachedPrice.timestamp)/1000),
-    });
+    return res.json({ price: cachedPrice.price, ticker: TICKER, cached: true, age: Math.floor((Date.now()-cachedPrice.timestamp)/1000) });
   }
-  fetchLivePriceFromSource().then(p => res.json({ price: p, ticker: TICKER, cached: false }));
+  fetchLivePrice().then(p => res.json({ price: p, ticker: TICKER, cached: false }));
 });
 
 app.get('/candles', async (req,res) => {
@@ -634,7 +762,7 @@ app.get('/candles', async (req,res) => {
 
 app.get('/news', async (req,res) => {
   try {
-    const q=encodeURIComponent('gold price XAU OR Federal Reserve interest rates OR inflation CPI dollar');
+    const q=encodeURIComponent('gold price XAU OR Federal Reserve interest rates OR inflation CPI');
     const r=await axios.get(`https://newsapi.org/v2/everything?q=${q}&language=en&sortBy=publishedAt&pageSize=15&apiKey=${NEWS_API_KEY}`,{timeout:10000});
     if (!r.data?.articles) return res.json([]);
     res.json(r.data.articles.filter(a=>a.title&&a.title!=='[Removed]').map(a=>{
@@ -650,31 +778,31 @@ app.get('/news', async (req,res) => {
 app.post('/webhook', express.json(), (req,res) => {
   try {
     const data=req.body;
-    if (!data.action||!data.price||!data.ticker) return res.status(400).json({error:'Missing fields'});
+    if (!data.action||!data.price||!data.ticker) return res.status(400).json({error:'Missing'});
     const confidence=parseInt(data.confidence)||0;
     if (confidence<75) return res.json({filtered:true});
     const tf=data.timeframe||'';
-    const signal={ticker:data.ticker||'XAU/USD',action:data.action.toUpperCase(),price:parseFloat(data.price),sl:data.sl?parseFloat(data.sl):null,tp1:data.tp1?parseFloat(data.tp1):null,tp2:data.tp2?parseFloat(data.tp2):null,timeframe:tf,confidence,fib_level:data.fib_level||null,pattern:data.pattern||null,rsi:data.rsi?parseFloat(data.rsi):null,atr:data.atr?parseFloat(data.atr):null,current_price:parseFloat(data.price),entry_valid_for:tf.includes('H')?(tf==='1H'?2:8):24,mtf:JSON.stringify({h1:data.mtf?.h1||false,h4:data.mtf?.h4||false,d1:data.mtf?.d1||false}),timestamp:Date.now()};
-    db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome) VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')`).run(signal);
+    const signal={ticker:data.ticker||'XAU/USD',action:data.action.toUpperCase(),price:parseFloat(data.price),sl:data.sl?parseFloat(data.sl):null,tp1:data.tp1?parseFloat(data.tp1):null,tp2:data.tp2?parseFloat(data.tp2):null,timeframe:tf,confidence,fib_level:data.fib_level||null,pattern:data.pattern||null,strategy:'TradingView',rsi:data.rsi?parseFloat(data.rsi):null,atr:data.atr?parseFloat(data.atr):null,current_price:parseFloat(data.price),entry_valid_for:tf.includes('H')?(tf==='1H'?2:8):24,mtf:JSON.stringify({h1:data.mtf?.h1||false,h4:data.mtf?.h4||false,d1:data.mtf?.d1||false}),timestamp:Date.now()};
+    db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome) VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')`).run(signal);
     sendSignalPush({...signal,id:db.prepare('SELECT last_insert_rowid() as id').get().id});
-    res.json({success:true,signal});
+    res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
 app.post('/autotrade/connect-mt5', express.json(), async (req,res) => {
   const {login,password,server,platform,lotSize,autoTradeEnabled}=req.body;
-  if (!login||!password||!server) return res.status(400).json({error:'Missing credentials'});
+  if (!login||!password||!server) return res.status(400).json({error:'Missing'});
   if (!METAAPI_TOKEN) return res.status(500).json({error:'MetaApi not configured'});
   try {
     const r=await axios.post('https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts',{login:login.toString(),password,name:'Pulstrade_'+login,server,platform:platform||'mt5',magic:20240410,application:'MetaApi',type:'cloud'},{headers:{'auth-token':METAAPI_TOKEN,'Content-Type':'application/json'},timeout:30000});
     db.prepare('INSERT OR REPLACE INTO autotrade_accounts (account_id,lot_size,auto_trade) VALUES (?,?,?)').run(r.data.id,lotSize||0.01,autoTradeEnabled?1:0);
     res.json({success:true,accountId:r.data.id});
-  } catch(e) { res.status(500).json({error:e.response?.data?.message||'Connection failed'}); }
+  } catch(e) { res.status(500).json({error:e.response?.data?.message||'Failed'}); }
 });
 
 app.post('/autotrade/connect', express.json(), (req,res) => {
   const {accountId,autoTradeEnabled}=req.body;
-  if (!accountId) return res.status(400).json({error:'Missing accountId'});
+  if (!accountId) return res.status(400).json({error:'Missing'});
   db.prepare('UPDATE autotrade_accounts SET auto_trade=? WHERE account_id=?').run(autoTradeEnabled?1:0,accountId);
   res.json({success:true});
 });
@@ -695,17 +823,15 @@ function generateWeeklyCalendar(now) {
     d.setUTCHours(hour, min, 0, 0);
     return d.toISOString();
   };
-  const allEvents = [
-    { title: 'EUR CPI Flash Estimate', currency: 'EUR', category: 'Inflation', impact: 'high', time: getDay(0, 10, 0), forecast: '2.2%', previous: '2.3%', actual: null },
-    { title: 'US ISM Manufacturing', currency: 'USD', category: 'Business', impact: 'medium', time: getDay(0, 15, 0), forecast: '48.5', previous: '47.8', actual: null },
+  const events = [
     { title: 'US CPI (MoM)', currency: 'USD', category: 'Inflation', impact: 'high', time: getDay(1, 13, 30), forecast: '0.3%', previous: '0.4%', actual: null },
     { title: 'FOMC Meeting Minutes', currency: 'USD', category: 'Central Bank', impact: 'high', time: getDay(2, 19, 0), forecast: '—', previous: '—', actual: null },
     { title: 'US Jobless Claims', currency: 'USD', category: 'Employment', impact: 'medium', time: getDay(3, 13, 30), forecast: '215K', previous: '210K', actual: null },
     { title: 'US Non-Farm Payrolls', currency: 'USD', category: 'Employment', impact: 'high', time: getDay(4, 13, 30), forecast: '185K', previous: '175K', actual: null },
-    { title: 'US Core PCE Price Index', currency: 'USD', category: 'Inflation', impact: 'high', time: getDay(4, 13, 30), forecast: '0.3%', previous: '0.3%', actual: null },
+    { title: 'US Core PCE', currency: 'USD', category: 'Inflation', impact: 'high', time: getDay(4, 13, 30), forecast: '0.3%', previous: '0.3%', actual: null },
   ];
   const cutoff = new Date(now.getTime() - 24 * 3600000);
-  return allEvents.filter(e => new Date(e.time) >= cutoff).sort((a, b) => new Date(a.time) - new Date(b.time)).map(e => {
+  return events.filter(e => new Date(e.time) >= cutoff).sort((a, b) => new Date(a.time) - new Date(b.time)).map(e => {
     const eventTime = new Date(e.time);
     const diff = eventTime - now;
     const diffMin = Math.floor(diff / 60000);
@@ -723,7 +849,7 @@ function generateWeeklyCalendar(now) {
   });
 }
 
-// ── Start ──────────────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────
 scanForSignals();
 setInterval(scanForSignals, 5*60*1000);
-app.listen(PORT, () => console.log(`Pulstrade backend v3.3 (real tracking) on port ${PORT}`));
+app.listen(PORT, () => console.log(`Pulstrade Backend v4.0 — Multi-Strategy on port ${PORT}`));
