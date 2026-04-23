@@ -539,8 +539,9 @@ function scanEmaPullback(candles, tf) {
 
   // BUY: Uptrend + price pulled back to EMA20 or EMA50
   if (uptrend) {
-    const nearEma20 = Math.abs(price - ema20) < atr * 1.0 && price < ema20;
-    const nearEma50 = Math.abs(price - ema50) < atr * 1.5 && price < ema50;
+    // Looser check — price below EMA within 3 ATR range
+    const nearEma20 = Math.abs(price - ema20) < atr * 2.5 && price < ema20;
+    const nearEma50 = Math.abs(price - ema50) < atr * 3.0 && price < ema50;
     
     if (nearEma20 || nearEma50) {
       let score = 40;
@@ -560,7 +561,7 @@ function scanEmaPullback(candles, tf) {
       const tp2 = Math.round((price + atr * 4.5)*100)/100;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (rr >= 1.3 && score >= 50) {
+      if (rr >= 1.2 && score >= 40) {
         signals.push({
           action: 'BUY', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -577,8 +578,9 @@ function scanEmaPullback(candles, tf) {
 
   // SELL: Downtrend + price pulled up to EMA20 or EMA50
   if (downtrend) {
-    const nearEma20 = Math.abs(price - ema20) < atr * 1.0 && price > ema20;
-    const nearEma50 = Math.abs(price - ema50) < atr * 1.5 && price > ema50;
+    // Looser check — price above EMA within 3 ATR range
+    const nearEma20 = Math.abs(price - ema20) < atr * 2.5 && price > ema20;
+    const nearEma50 = Math.abs(price - ema50) < atr * 3.0 && price > ema50;
     
     if (nearEma20 || nearEma50) {
       let score = 40;
@@ -597,7 +599,7 @@ function scanEmaPullback(candles, tf) {
       const tp2 = Math.round((price - atr * 4.5)*100)/100;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (rr >= 1.3 && score >= 50) {
+      if (rr >= 1.2 && score >= 40) {
         signals.push({
           action: 'SELL', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -624,10 +626,10 @@ async function scanForSignals() {
   if (!cachedPrice.price) { console.log('⚠️ No live price'); return; }
 
   const timeframes = [
-    { label: '15m', interval: '15min', validFor: 0.5, minScore: 60 },
-    { label: '30m', interval: '30min', validFor: 1,   minScore: 62 },
-    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 65 },
-    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 63 },
+    { label: '15m', interval: '15min', validFor: 0.5, minScore: 45 },
+    { label: '30m', interval: '30min', validFor: 1,   minScore: 48 },
+    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 50 },
+    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 48 },
   ];
 
   for (const tf of timeframes) {
@@ -747,7 +749,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.2.0-ema-pullback' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.3.1-final' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -911,10 +913,10 @@ app.post('/autotrade/connect', express.json(), (req,res) => {
 app.get('/scan-debug', async (req, res) => {
   const results = { timestamp: new Date().toISOString(), livePrice: cachedPrice.price, timeframes: {} };
   const timeframes = [
-    { label: '15m', interval: '15min', validFor: 0.5, minScore: 60 },
-    { label: '30m', interval: '30min', validFor: 1,   minScore: 62 },
-    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 65 },
-    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 63 },
+    { label: '15m', interval: '15min', validFor: 0.5, minScore: 45 },
+    { label: '30m', interval: '30min', validFor: 1,   minScore: 48 },
+    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 50 },
+    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 48 },
   ];
 
   for (const tf of timeframes) {
