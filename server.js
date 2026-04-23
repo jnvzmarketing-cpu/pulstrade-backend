@@ -256,12 +256,13 @@ function scanFibPullback(candles, tf) {
   const signals = [];
 
   for (const [fibName, fibValue] of Object.entries(fibs)) {
-    const tolerance = atr * 2.0;
+    const tolerance = atr * 2.5;
     if (Math.abs(price - fibValue) > tolerance) continue;
 
     const action = uptrend ? 'BUY' : 'SELL';
-    const isBuyZone  = price < swingLow  + fibRange * 0.55;
-    const isSellZone = price > swingHigh - fibRange * 0.55;
+    // Relaxed zone: price in lower/upper 70% of range (was 55%)
+    const isBuyZone  = price < swingLow  + fibRange * 0.70;
+    const isSellZone = price > swingHigh - fibRange * 0.70;
     if (action==='BUY'  && !isBuyZone)  continue;
     if (action==='SELL' && !isSellZone) continue;
 
@@ -331,7 +332,7 @@ function scanRangeBounce(candles, tf) {
   // Range = EMA50 close to EMA200 (no strong trend)
   if (!ema50 || !ema200) return [];
   const emaDiff = Math.abs(ema50 - ema200) / ema200;
-  if (emaDiff > 0.02) return []; // > 2% difference = too trendy, skip
+  if (emaDiff > 0.03) return []; // > 3% difference = too trendy, skip (was 2%)
 
   // Find range high/low
   let rangeHigh=-Infinity, rangeLow=Infinity;
@@ -341,7 +342,7 @@ function scanRangeBounce(candles, tf) {
     if (candles[i].low  < rangeLow)  rangeLow = candles[i].low;
   }
   const rangeSize = rangeHigh - rangeLow;
-  if (rangeSize < atr * 3) return []; // range too small
+  if (rangeSize < atr * 2) return []; // range too small (was 3)
 
   const bb = calcBollingerBands(closes);
   if (!bb) return [];
@@ -352,7 +353,7 @@ function scanRangeBounce(candles, tf) {
   const nearLow = price < rangeLow + rangeSize * 0.25;
   const atBBLower = price <= bb.lower * 1.005;
 
-  if (nearLow && atBBLower && rsi < 45) {
+  if (nearLow && atBBLower && rsi < 55) {
     let score = 30; // base
     const reasons = ['Range Low Bounce: +30pts'];
     
@@ -386,7 +387,7 @@ function scanRangeBounce(candles, tf) {
   const nearHigh = price > rangeHigh - rangeSize * 0.25;
   const atBBUpper = price >= bb.upper * 0.995;
 
-  if (nearHigh && atBBUpper && rsi > 55) {
+  if (nearHigh && atBBUpper && rsi > 45) {
     let score = 30;
     const reasons = ['Range High Rejection: +30pts'];
 
@@ -436,7 +437,7 @@ function scanBreakout(candles, tf) {
     if (candles[i].low  < consLow)  consLow = candles[i].low;
   }
   const consRange = consHigh - consLow;
-  if (consRange < atr * 2) return []; // consolidation too tight
+  if (consRange < atr * 1.5) return []; // consolidation too tight (was 2)
 
   const signals = [];
 
@@ -517,6 +518,104 @@ function scanBreakout(candles, tf) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// STRATEGY 4: EMA PULLBACK (Very common — trend + mini-correction)
+// ════════════════════════════════════════════════════════════════════════
+function scanEmaPullback(candles, tf) {
+  const closes = candles.map(c => c.close);
+  const price = closes[0];
+  const rsi = calcRSI(closes);
+  const atr = calcATR(candles);
+
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const ema200 = calcEMA(closes, 200);
+  if (!ema20 || !ema50 || !ema200) return [];
+
+  const uptrend = ema50 > ema200;
+  const downtrend = ema50 < ema200;
+  if (!uptrend && !downtrend) return [];
+
+  const signals = [];
+
+  // BUY: Uptrend + price pulled back to EMA20 or EMA50
+  if (uptrend) {
+    const nearEma20 = Math.abs(price - ema20) < atr * 1.0 && price < ema20;
+    const nearEma50 = Math.abs(price - ema50) < atr * 1.5 && price < ema50;
+    
+    if (nearEma20 || nearEma50) {
+      let score = 40;
+      const reasons = [nearEma20 ? 'Pullback to EMA20: +40pts' : 'Pullback to EMA50: +40pts'];
+
+      if (rsi >= 30 && rsi <= 55) { score += 20; reasons.push('RSI oversold: +20pts'); }
+      else if (rsi < 30) { score += 15; reasons.push('RSI very oversold: +15pts'); }
+
+      const pattern = detectPattern(candles, 'BUY');
+      if (pattern.score > 0) { score += pattern.score; reasons.push(`${pattern.name}: +${pattern.score}pts`); }
+
+      // Trend strength bonus
+      if (price > ema200) { score += 10; reasons.push('Above EMA200: +10pts'); }
+
+      const sl = Math.round((Math.min(ema50, ema20) - atr * 2)*100)/100;
+      const tp1 = Math.round((price + atr * 2.5)*100)/100;
+      const tp2 = Math.round((price + atr * 4.5)*100)/100;
+      const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+
+      if (rr >= 1.3 && score >= 50) {
+        signals.push({
+          action: 'BUY', price: Math.round(price*100)/100,
+          sl, tp1, tp2,
+          confidence: Math.min(Math.round(score), 100),
+          fib_level: null,
+          pattern: pattern.name,
+          strategy: 'EMA Pullback',
+          note: reasons.slice(0,3).join(' | '),
+          rsi, atr,
+        });
+      }
+    }
+  }
+
+  // SELL: Downtrend + price pulled up to EMA20 or EMA50
+  if (downtrend) {
+    const nearEma20 = Math.abs(price - ema20) < atr * 1.0 && price > ema20;
+    const nearEma50 = Math.abs(price - ema50) < atr * 1.5 && price > ema50;
+    
+    if (nearEma20 || nearEma50) {
+      let score = 40;
+      const reasons = [nearEma20 ? 'Rally to EMA20: +40pts' : 'Rally to EMA50: +40pts'];
+
+      if (rsi >= 45 && rsi <= 70) { score += 20; reasons.push('RSI overbought: +20pts'); }
+      else if (rsi > 70) { score += 15; reasons.push('RSI very overbought: +15pts'); }
+
+      const pattern = detectPattern(candles, 'SELL');
+      if (pattern.score > 0) { score += pattern.score; reasons.push(`${pattern.name}: +${pattern.score}pts`); }
+
+      if (price < ema200) { score += 10; reasons.push('Below EMA200: +10pts'); }
+
+      const sl = Math.round((Math.max(ema50, ema20) + atr * 2)*100)/100;
+      const tp1 = Math.round((price - atr * 2.5)*100)/100;
+      const tp2 = Math.round((price - atr * 4.5)*100)/100;
+      const rr = Math.abs(tp1-price) / Math.abs(price-sl);
+
+      if (rr >= 1.3 && score >= 50) {
+        signals.push({
+          action: 'SELL', price: Math.round(price*100)/100,
+          sl, tp1, tp2,
+          confidence: Math.min(Math.round(score), 100),
+          fib_level: null,
+          pattern: pattern.name,
+          strategy: 'EMA Pullback',
+          note: reasons.slice(0,3).join(' | '),
+          rsi, atr,
+        });
+      }
+    }
+  }
+
+  return signals;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // MAIN SCANNER — runs all strategies on all timeframes
 // ════════════════════════════════════════════════════════════════════════
 async function scanForSignals() {
@@ -544,11 +643,12 @@ async function scanForSignals() {
         if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles`); continue; }
       }
 
-      // Run all 3 strategies
+      // Run all 4 strategies
       const fibSignals    = scanFibPullback(candles, tf);
       const rangeSignals  = scanRangeBounce(candles, tf);
       const breakoutSigs  = scanBreakout(candles, tf);
-      const allSignals    = [...fibSignals, ...rangeSignals, ...breakoutSigs];
+      const emaSignals    = scanEmaPullback(candles, tf);
+      const allSignals    = [...fibSignals, ...rangeSignals, ...breakoutSigs, ...emaSignals];
 
       for (const sig of allSignals) {
         // Filter by minimum confidence
@@ -647,7 +747,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.1.0-loosened' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.2.0-ema-pullback' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -655,7 +755,7 @@ app.get('/health', (req,res) => res.json({
   closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
   marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
-  strategies: ['FIB', 'Range Bounce', 'Breakout'],
+  strategies: ['FIB', 'Range Bounce', 'Breakout', 'EMA Pullback'],
   timeframes: ['15m', '30m', '1H', '4H'],
 }));
 
@@ -831,6 +931,7 @@ app.get('/scan-debug', async (req, res) => {
       const fibSignals    = scanFibPullback(candles, tf);
       const rangeSignals  = scanRangeBounce(candles, tf);
       const breakoutSigs  = scanBreakout(candles, tf);
+      const emaSignals    = scanEmaPullback(candles, tf);
       
       results.timeframes[tf.label] = {
         price: price.toFixed(2),
@@ -842,6 +943,7 @@ app.get('/scan-debug', async (req, res) => {
         fib: { count: fibSignals.length, signals: fibSignals.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore,fibLevel:s.fib_level})) },
         range: { count: rangeSignals.length, signals: rangeSignals.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore})) },
         breakout: { count: breakoutSigs.length, signals: breakoutSigs.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore})) },
+        ema: { count: emaSignals.length, signals: emaSignals.map(s => ({action:s.action,conf:s.confidence,passes:s.confidence>=tf.minScore})) },
       };
     } catch(e) { results.timeframes[tf.label] = { error: e.message }; }
   }
