@@ -561,7 +561,7 @@ function scanEmaPullback(candles, tf) {
       const tp2 = Math.round((price + atr * 4.5)*100)/100;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (rr >= 1.2 && score >= 40) {
+      if (rr >= 1.0 && score >= 30) {
         signals.push({
           action: 'BUY', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -599,7 +599,7 @@ function scanEmaPullback(candles, tf) {
       const tp2 = Math.round((price - atr * 4.5)*100)/100;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (rr >= 1.2 && score >= 40) {
+      if (rr >= 1.0 && score >= 30) {
         signals.push({
           action: 'SELL', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -749,7 +749,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.3.1-final' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.3.2-force-scan' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -953,10 +953,12 @@ app.get('/scan-debug', async (req, res) => {
 });
 
 // ── FORCE SCAN — manually trigger scanner ──────────────────
-app.post('/force-scan', async (req, res) => {
+// ── FORCE SCAN — manually trigger scanner ──────────────────
+app.get('/force-scan', async (req, res) => {
+  const before = db.prepare('SELECT COUNT(*) as c FROM signals').get().c;
   await scanForSignals();
-  const newSignals = db.prepare('SELECT COUNT(*) as c FROM signals WHERE timestamp > ?').get(Date.now() - 60000).c;
-  res.json({ triggered: true, newSignalsInLast60s: newSignals });
+  const after = db.prepare('SELECT COUNT(*) as c FROM signals').get().c;
+  res.json({ triggered: true, signalsBefore: before, signalsAfter: after, newSignals: after - before });
 });
 
 app.get('/calendar', async (req, res) => {
