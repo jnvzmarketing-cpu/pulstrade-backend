@@ -62,7 +62,11 @@ db.exec(`
     entry_valid_for REAL,
     mtf             TEXT,
     timestamp       INTEGER NOT NULL,
-    created_at      INTEGER DEFAULT (strftime('%s','now') * 1000)
+    created_at      INTEGER DEFAULT (strftime('%s','now') * 1000),
+    outcome         TEXT DEFAULT 'open',
+    exit_price      REAL,
+    closed_at       INTEGER,
+    pnl_r           REAL
   );
   CREATE TABLE IF NOT EXISTS autotrade_accounts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,22 +77,30 @@ db.exec(`
   );
 `);
 
-// ── CLEANUP — remove old 1D signals (wrong price data) ──────────────────────
+// ── Migrations — add outcome columns if old DB ──────────────────────────
 try {
-  const deleted1D = db.prepare("DELETE FROM signals WHERE timeframe = '1D'").run();
-  console.log(`✓ Cleanup: deleted ${deleted1D.changes} old 1D signals with wrong price data`);
+  const cols = db.prepare("PRAGMA table_info(signals)").all().map(c => c.name);
+  if (!cols.includes('outcome'))    db.exec("ALTER TABLE signals ADD COLUMN outcome TEXT DEFAULT 'open'");
+  if (!cols.includes('exit_price')) db.exec("ALTER TABLE signals ADD COLUMN exit_price REAL");
+  if (!cols.includes('closed_at'))  db.exec("ALTER TABLE signals ADD COLUMN closed_at INTEGER");
+  if (!cols.includes('pnl_r'))      db.exec("ALTER TABLE signals ADD COLUMN pnl_r REAL");
+  console.log('✓ Migrations applied');
+} catch(e) { console.error('Migration error:', e.message); }
+
+// ── CLEANUP on startup ──────────────────────────────────────────────────
+try {
+  const del1D = db.prepare("DELETE FROM signals WHERE timeframe = '1D'").run();
+  console.log(`✓ Deleted ${del1D.changes} old 1D signals`);
 } catch(e) { console.error('Cleanup error:', e.message); }
-
-// ── CLEANUP — remove old signals with stale price (>7 days) ──────────────
 try {
-  const staleCutoff = Date.now() - 7*24*3600000;
-  const deletedStale = db.prepare("DELETE FROM signals WHERE timestamp < ?").run(staleCutoff);
-  console.log(`✓ Cleanup: deleted ${deletedStale.changes} old signals older than 7 days`);
-} catch(e) { console.error('Stale cleanup error:', e.message); }
+  const staleCut = Date.now() - 30*24*3600000;
+  const delStale = db.prepare("DELETE FROM signals WHERE timestamp < ?").run(staleCut);
+  console.log(`✓ Deleted ${delStale.changes} signals older than 30 days`);
+} catch(e) {}
 
-// ── PRICE CACHE — single source of truth, updated every 30s ──────────────
+// ── PRICE CACHE ─────────────────────────────────────────────────────────
 let cachedPrice = { price: null, timestamp: 0 };
-const PRICE_CACHE_TTL = 30 * 1000; // 30 seconds
+const PRICE_CACHE_TTL = 30 * 1000;
 
 async function fetchLivePriceFromSource() {
   if (!TWELVE_API_KEY) return null;
@@ -105,17 +117,49 @@ async function fetchLivePriceFromSource() {
     }
     if (r.data?.code === 429) console.warn('⚠️ Twelve Data rate limit reached');
     return null;
-  } catch(e) {
-    console.error('Price fetch error:', e.message);
-    return null;
-  }
+  } catch(e) { return null; }
 }
-
-// Initial fetch + refresh every 30s
 fetchLivePriceFromSource();
 setInterval(fetchLivePriceFromSource, PRICE_CACHE_TTL);
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── CANDLE CACHE ────────────────────────────────────────────────────────
+const candleCache = {};
+const CANDLE_CACHE_TTL = 5 * 60 * 1000;
+
+async function fetchCandles(interval, outputsize=60) {
+  const cacheKey = `${interval}_${outputsize}`;
+  const cached = candleCache[cacheKey];
+  if (cached && (Date.now() - cached.timestamp) < CANDLE_CACHE_TTL) return cached.data;
+  if (!TWELVE_API_KEY) return generateMockCandles(outputsize);
+  try {
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(TICKER)}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_API_KEY}&format=JSON`;
+    const res = await axios.get(url, { timeout: 10000 });
+    if (!res.data?.values) return cached?.data || generateMockCandles(outputsize);
+    const candles = res.data.values.map(v => ({
+      open: parseFloat(v.open), high: parseFloat(v.high),
+      low:  parseFloat(v.low),  close: parseFloat(v.close),
+      timestamp: new Date(v.datetime).getTime(),
+    }));
+    candleCache[cacheKey] = { data: candles, timestamp: Date.now() };
+    return candles;
+  } catch(e) { return cached?.data || generateMockCandles(outputsize); }
+}
+
+function generateMockCandles(count) {
+  const candles = [];
+  const basePrice = cachedPrice.price || 3300;
+  let price = basePrice + Math.random()*30;
+  const now = Date.now();
+  for (let i=count-1; i>=0; i--) {
+    const change = (Math.random()-0.5)*15;
+    const open=price, close=price+change;
+    candles.push({ open, high:Math.max(open,close)+Math.random()*8, low:Math.min(open,close)-Math.random()*8, close, timestamp:now-i*300000 });
+    price = close;
+  }
+  return candles;
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────
 function timeAgo(date) {
   const s = Math.floor((new Date() - date) / 1000);
   if (s < 3600)  return `${Math.floor(s/60)}m ago`;
@@ -154,52 +198,7 @@ function isMarketClosed() {
   return day === 6 || day === 0 || (day === 5 && hour >= 21) || (day === 1 && hour < 1);
 }
 
-// ── CANDLE CACHE — cache candles per interval for 5 minutes ──────────────
-const candleCache = {};
-const CANDLE_CACHE_TTL = 5 * 60 * 1000;
-
-async function fetchCandles(interval, outputsize=60) {
-  const cacheKey = `${interval}_${outputsize}`;
-  const cached = candleCache[cacheKey];
-  if (cached && (Date.now() - cached.timestamp) < CANDLE_CACHE_TTL) {
-    return cached.data;
-  }
-
-  if (!TWELVE_API_KEY) return generateMockCandles(outputsize);
-  try {
-    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(TICKER)}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_API_KEY}&format=JSON`;
-    const res = await axios.get(url, { timeout: 10000 });
-    if (!res.data?.values) {
-      if (res.data?.code === 429) console.warn(`⚠️ Rate limit on ${interval} candles`);
-      return cached?.data || generateMockCandles(outputsize);
-    }
-    const candles = res.data.values.map(v => ({
-      open: parseFloat(v.open), high: parseFloat(v.high),
-      low:  parseFloat(v.low),  close: parseFloat(v.close),
-      timestamp: new Date(v.datetime).getTime(),
-    }));
-    candleCache[cacheKey] = { data: candles, timestamp: Date.now() };
-    return candles;
-  } catch(e) {
-    return cached?.data || generateMockCandles(outputsize);
-  }
-}
-
-function generateMockCandles(count) {
-  const candles = [];
-  const basePrice = cachedPrice.price || 3300;
-  let price = basePrice + Math.random()*30;
-  const now = Date.now();
-  for (let i=count-1; i>=0; i--) {
-    const change = (Math.random()-0.5)*15;
-    const open=price, close=price+change;
-    candles.push({ open, high:Math.max(open,close)+Math.random()*8, low:Math.min(open,close)-Math.random()*8, close, timestamp:now-i*300000 });
-    price = close;
-  }
-  return candles;
-}
-
-// ── Confluence Score ───────────────────────────────────────────────────────────
+// ── Confluence Score ───────────────────────────────────────────────────
 function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   let score = 0;
   const reasons = [];
@@ -234,24 +233,20 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
 
   let emaScore = 0;
   if (action === 'BUY') {
-    if (!uptrend) {
-      emaScore = -10;
-      reasons.push('Counter-trend BUY (downtrend): -10pts');
-    } else {
+    if (!uptrend) { emaScore = -10; reasons.push('Counter-trend BUY: -10pts'); }
+    else {
       if (price > ema20)  emaScore += 8;
       if (price > ema50)  emaScore += 7;
       if (price > ema200) emaScore += 5;
-      reasons.push(`Uptrend confirmed (EMA50>EMA200): +${emaScore}pts`);
+      reasons.push(`Uptrend confirmed: +${emaScore}pts`);
     }
   } else {
-    if (!downtrend) {
-      emaScore = -10;
-      reasons.push('Counter-trend SELL (uptrend): -10pts');
-    } else {
+    if (!downtrend) { emaScore = -10; reasons.push('Counter-trend SELL: -10pts'); }
+    else {
       if (price < ema20)  emaScore += 8;
       if (price < ema50)  emaScore += 7;
       if (price < ema200) emaScore += 5;
-      reasons.push(`Downtrend confirmed (EMA50<EMA200): +${emaScore}pts`);
+      reasons.push(`Downtrend confirmed: +${emaScore}pts`);
     }
   }
   score += emaScore;
@@ -286,23 +281,110 @@ function calcConfluenceScore(candles, action, fibLevel, atr, rsi) {
   return { score: Math.min(Math.round(score), 100), reasons, patternName };
 }
 
-// ── MAIN SCANNER ──────────────────────────────────────────────────────────────
-async function scanForSignals() {
-  if (isMarketClosed()) { console.log('Market closed — skipping scan'); return; }
-  if (isEconomicEventSoon(30)) { console.log('⚠️ Economic event soon — scan blocked'); return; }
+// ── OUTCOME TRACKER — real TP/SL hit detection ──────────────────────────
+async function trackSignalOutcomes() {
+  try {
+    // Find all open signals
+    const openSignals = db.prepare("SELECT * FROM signals WHERE outcome = 'open' OR outcome IS NULL").all();
+    if (openSignals.length === 0) return;
 
-  // Skip scan if no live price available
-  if (!cachedPrice.price) {
-    console.log('⚠️ No live price cached — skipping scan');
-    return;
+    console.log(`🔍 Tracking ${openSignals.length} open signals...`);
+
+    // Fetch recent candles once for all checks (5m interval = granular enough)
+    const candles = await fetchCandles('5min', 100);
+    if (!candles || candles.length < 5) {
+      console.log('⚠️ No candles available for outcome tracking');
+      return;
+    }
+
+    // Sort oldest → newest for scanning
+    const sortedCandles = [...candles].sort((a, b) => a.timestamp - b.timestamp);
+
+    let closedCount = 0;
+
+    for (const signal of openSignals) {
+      try {
+        // Only check candles AFTER signal timestamp
+        const relevantCandles = sortedCandles.filter(c => c.timestamp > signal.timestamp);
+        if (relevantCandles.length === 0) continue;
+
+        const isBuy = signal.action === 'BUY';
+        const entry = signal.price;
+        const sl    = signal.sl;
+        const tp1   = signal.tp1;
+        const tp2   = signal.tp2;
+
+        if (!sl || !tp1) continue;
+
+        let outcome = null;
+        let exitPrice = null;
+        let exitTime = null;
+        let pnlR = null;
+
+        // Scan candles in order — first one to hit SL or TP wins
+        for (const c of relevantCandles) {
+          if (isBuy) {
+            // BUY: SL below, TP above
+            if (c.low <= sl)  { outcome='sl_hit';  exitPrice=sl;  exitTime=c.timestamp; break; }
+            if (c.high >= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
+            if (c.high >= tp1){ outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
+          } else {
+            // SELL: SL above, TP below
+            if (c.high >= sl) { outcome='sl_hit';  exitPrice=sl;  exitTime=c.timestamp; break; }
+            if (c.low <= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
+            if (c.low <= tp1) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
+          }
+        }
+
+        // Expired check — signal older than 48h and no hit → mark expired
+        if (!outcome) {
+          const ageHours = (Date.now() - signal.timestamp) / 3600000;
+          if (ageHours > 48) {
+            outcome = 'expired';
+            // Close at current price if available
+            const lastCandle = relevantCandles[relevantCandles.length - 1];
+            exitPrice = lastCandle ? lastCandle.close : entry;
+            exitTime = lastCandle ? lastCandle.timestamp : Date.now();
+          }
+        }
+
+        if (outcome) {
+          // Calculate PnL in R units (1R = risk to SL)
+          const risk = Math.abs(entry - sl);
+          const profit = isBuy ? (exitPrice - entry) : (entry - exitPrice);
+          pnlR = risk > 0 ? profit / risk : 0;
+
+          db.prepare(`UPDATE signals SET outcome=?, exit_price=?, closed_at=?, pnl_r=? WHERE id=?`)
+            .run(outcome, exitPrice, exitTime, Math.round(pnlR * 100) / 100, signal.id);
+
+          console.log(`✓ Signal #${signal.id} ${signal.action} closed: ${outcome} @ ${exitPrice.toFixed(2)} (${pnlR >= 0 ? '+' : ''}${pnlR.toFixed(2)}R)`);
+          closedCount++;
+        }
+      } catch(e) {
+        console.error(`Tracker error for signal #${signal.id}:`, e.message);
+      }
+    }
+
+    if (closedCount > 0) console.log(`✓ Closed ${closedCount} signals this cycle`);
+  } catch(e) {
+    console.error('Outcome tracker error:', e.message);
   }
+}
+
+// Run outcome tracker every 15 minutes
+trackSignalOutcomes();
+setInterval(trackSignalOutcomes, 15 * 60 * 1000);
+
+// ── MAIN SCANNER ──────────────────────────────────────────────────────────
+async function scanForSignals() {
+  if (isMarketClosed()) { console.log('Market closed'); return; }
+  if (isEconomicEventSoon(30)) { console.log('⚠️ Economic event block'); return; }
+  if (!cachedPrice.price) { console.log('⚠️ No live price'); return; }
 
   const timeframes = [
     { label:'1H', interval:'1h', validFor:2, minScore:75 },
     { label:'4H', interval:'4h', validFor:8, minScore:73 },
   ];
-
-  const newSignals = [];
 
   for (const tf of timeframes) {
     try {
@@ -312,13 +394,10 @@ async function scanForSignals() {
       const closes = candles.map(c => c.close);
       const price  = closes[0];
 
-      // VALIDATE: price must be close to live price (protect against stale data)
+      // Deviation check
       if (cachedPrice.price) {
-        const deviation = Math.abs(price - cachedPrice.price) / cachedPrice.price;
-        if (deviation > 0.05) {
-          console.log(`⚠️ [${tf.label}] Candle price ${price.toFixed(2)} deviates ${(deviation*100).toFixed(1)}% from live ${cachedPrice.price.toFixed(2)} — skipping (stale data)`);
-          continue;
-        }
+        const dev = Math.abs(price - cachedPrice.price) / cachedPrice.price;
+        if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles — skipping`); continue; }
       }
 
       const ema50  = calcEMA(closes, Math.min(50, closes.length-1));
@@ -326,7 +405,7 @@ async function scanForSignals() {
       const masterUptrend   = ema50 && ema200 && ema50 > ema200;
       const masterDowntrend = ema50 && ema200 && ema50 < ema200;
 
-      console.log(`[${tf.label}] Price:${price.toFixed(2)} EMA50:${ema50?.toFixed(2)} EMA200:${ema200?.toFixed(2)} Trend:${masterUptrend?'UP':masterDowntrend?'DOWN':'NEUTRAL'}`);
+      console.log(`[${tf.label}] $${price.toFixed(2)} Trend:${masterUptrend?'UP':masterDowntrend?'DOWN':'NEUTRAL'}`);
 
       let swingHigh=-Infinity, swingLow=Infinity;
       for (let i=0; i<30; i++) {
@@ -369,95 +448,75 @@ async function scanForSignals() {
         for (const action of ['BUY', 'SELL']) {
           if (action==='BUY'  && !isBuyZone)  continue;
           if (action==='SELL' && !isSellZone) continue;
-
-          if (action==='BUY'  && masterDowntrend) {
-            console.log(`[${tf.label}] BUY blocked — master downtrend (EMA50<EMA200)`);
-            continue;
-          }
-          if (action==='SELL' && masterUptrend) {
-            console.log(`[${tf.label}] SELL blocked — master uptrend (EMA50>EMA200)`);
-            continue;
-          }
+          if (action==='BUY'  && masterDowntrend) continue;
+          if (action==='SELL' && masterUptrend) continue;
 
           const confluence = calcConfluenceScore(candles, action, fibName, atr, rsi);
-
-          if (confluence.score < tf.minScore) {
-            console.log(`Signal filtered: ${action} ${fibName} score=${confluence.score} < ${tf.minScore}`);
-            continue;
-          }
+          if (confluence.score < tf.minScore) continue;
 
           const recent = db.prepare(
             `SELECT id FROM signals WHERE ticker=? AND action=? AND fib_level=? AND timeframe=? AND timestamp > ?`
           ).get(TICKER, action, fibName, tf.label, Date.now()-2*3600000);
-          if (recent) {
-            console.log(`[${tf.label}] ${action} ${fibName} skipped — same level traded recently`);
-            continue;
-          }
+          if (recent) continue;
 
           let sl, tp1, tp2;
-          const fibValuesSorted = Object.values(fibs).sort((a,b)=>a-b);
+          const fibSorted = Object.values(fibs).sort((a,b)=>a-b);
           if (action==='BUY') {
-            const nextDown = fibValuesSorted.filter(f=>f<fibValue).pop() || swingLow - atr;
+            const nextDown = fibSorted.filter(f=>f<fibValue).pop() || swingLow - atr;
             sl  = Math.round((nextDown - atr*1.5)*100)/100;
             tp1 = Math.round((fibValue + atr*3.0)*100)/100;
             tp2 = Math.round((fibValue + atr*5.0)*100)/100;
           } else {
-            const nextUp = fibValuesSorted.filter(f=>f>fibValue).shift() || swingHigh + atr;
+            const nextUp = fibSorted.filter(f=>f>fibValue).shift() || swingHigh + atr;
             sl  = Math.round((nextUp   + atr*1.5)*100)/100;
             tp1 = Math.round((fibValue - atr*3.0)*100)/100;
             tp2 = Math.round((fibValue - atr*5.0)*100)/100;
           }
 
-          const risk   = Math.abs(price - sl);
+          const risk = Math.abs(price - sl);
           const reward = Math.abs(tp1 - price);
-          const rr     = risk > 0 ? reward / risk : 0;
-          if (rr < 2.0) {
-            console.log(`[${tf.label}] ${action} filtered — R:R ${rr.toFixed(1)} < 2.0`);
-            continue;
-          }
+          const rr = risk > 0 ? reward / risk : 0;
+          if (rr < 2.0) continue;
 
           const signal = {
             ticker: TICKER, action,
-            price:  Math.round(price*100)/100,
+            price: Math.round(price*100)/100,
             sl, tp1, tp2,
-            timeframe:       tf.label,
-            confidence:      confluence.score,
-            fib_level:       fibName,
-            pattern:         confluence.patternName,
-            note:            confluence.reasons.slice(0,3).join(' | '),
-            rsi:             Math.round(rsi*10)/10,
+            timeframe: tf.label,
+            confidence: confluence.score,
+            fib_level: fibName,
+            pattern: confluence.patternName,
+            note: confluence.reasons.slice(0,3).join(' | '),
+            rsi: Math.round(rsi*10)/10,
             atr,
-            current_price:   Math.round(price*100)/100,
+            current_price: Math.round(price*100)/100,
             entry_valid_for: tf.validFor,
             mtf: JSON.stringify({ h1:tf.label==='1H', h4:tf.label==='4H', d1:false }),
             timestamp: Date.now(),
           };
 
           db.prepare(`INSERT INTO signals
-            (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp)
-            VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)
+            (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
+            VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
           `).run(signal);
 
-          console.log(`✓ SIGNAL: ${action} ${TICKER} @ ${price} (${tf.label}, ${fibName}, score:${confluence.score}, trend:${masterUptrend?'UP':masterDowntrend?'DOWN':'NEUTRAL'})`);
+          console.log(`✓ ${action} ${TICKER} @ ${price} (${tf.label}, ${fibName}, ${confluence.score}%)`);
           const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
           sendSignalPush({ ...signal, id: inserted.id });
-          newSignals.push(signal);
         }
       }
-    } catch(err) {
-      console.error(`Error scanning ${tf.label}:`, err.message);
-    }
+    } catch(err) { console.error(`Scanner error ${tf.label}:`, err.message); }
   }
-
-  return newSignals;
 }
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-app.get('/',       (req,res) => res.json({ status:'Pulstrade Backend', version:'3.2.0-cached' }));
+// ── Routes ────────────────────────────────────────────────────────────
+app.get('/',       (req,res) => res.json({ status:'Pulstrade Backend', version:'3.3.0-tracking' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
-  signals:db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
-  marketClosed:isMarketClosed(),
+  signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
+  open:    db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome='open' OR outcome IS NULL").get().c,
+  closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
+  marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
   cacheAge: cachedPrice.timestamp ? Math.floor((Date.now()-cachedPrice.timestamp)/1000) + 's' : 'none',
 }));
@@ -477,7 +536,82 @@ app.get('/signals/:id', (req,res) => {
   res.json({...row, mtf:row.mtf?JSON.parse(row.mtf):null});
 });
 
-// ── /price — serves CACHED price, no Twelve Data call per request ───────
+// ── /stats — REAL statistics from actual outcomes ─────────────────────
+app.get('/stats', (req, res) => {
+  try {
+    const all = db.prepare("SELECT * FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").all();
+    const totalClosed = all.length;
+    
+    if (totalClosed === 0) {
+      return res.json({
+        totalSignals: db.prepare("SELECT COUNT(*) as c FROM signals").get().c,
+        closedSignals: 0,
+        openSignals: db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome='open' OR outcome IS NULL").get().c,
+        winRate: null,
+        avgRR: null,
+        profitFactor: null,
+        totalPnL: null,
+        bestTrade: null,
+        worstTrade: null,
+        wins: 0, losses: 0, expired: 0,
+        fibPerformance: {},
+        message: 'Not enough closed trades yet. Stats will appear after signals close.',
+      });
+    }
+
+    const wins = all.filter(s => s.outcome === 'tp1_hit' || s.outcome === 'tp2_hit');
+    const losses = all.filter(s => s.outcome === 'sl_hit');
+    const expired = all.filter(s => s.outcome === 'expired');
+    
+    const decisiveClosed = wins.length + losses.length; // exclude expired from win rate
+    const winRate = decisiveClosed > 0 ? (wins.length / decisiveClosed) * 100 : 0;
+    
+    const allPnL = all.map(s => s.pnl_r || 0);
+    const totalPnL = allPnL.reduce((a,b) => a+b, 0);
+    const avgRR = all.length > 0 ? totalPnL / all.length : 0;
+    
+    const grossWin = wins.reduce((a,s) => a + (s.pnl_r || 0), 0);
+    const grossLoss = Math.abs(losses.reduce((a,s) => a + (s.pnl_r || 0), 0));
+    const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin;
+    
+    const bestTrade = allPnL.length > 0 ? Math.max(...allPnL) : 0;
+    const worstTrade = allPnL.length > 0 ? Math.min(...allPnL) : 0;
+    
+    // FIB performance breakdown
+    const fibPerformance = {};
+    for (const level of ['61.8%', '50.0%', '38.2%', '78.6%', '23.6%']) {
+      const atLevel = all.filter(s => s.fib_level === level);
+      const winsAtLevel = atLevel.filter(s => s.outcome === 'tp1_hit' || s.outcome === 'tp2_hit');
+      const lossesAtLevel = atLevel.filter(s => s.outcome === 'sl_hit');
+      const decisive = winsAtLevel.length + lossesAtLevel.length;
+      fibPerformance[level] = {
+        total: atLevel.length,
+        wins: winsAtLevel.length,
+        losses: lossesAtLevel.length,
+        winRate: decisive > 0 ? Math.round((winsAtLevel.length / decisive) * 1000) / 10 : null,
+      };
+    }
+
+    res.json({
+      totalSignals: db.prepare("SELECT COUNT(*) as c FROM signals").get().c,
+      closedSignals: totalClosed,
+      openSignals: db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome='open' OR outcome IS NULL").get().c,
+      winRate: Math.round(winRate * 10) / 10,
+      avgRR: Math.round(avgRR * 100) / 100,
+      profitFactor: Math.round(profitFactor * 100) / 100,
+      totalPnL: Math.round(totalPnL * 100) / 100,
+      bestTrade: Math.round(bestTrade * 100) / 100,
+      worstTrade: Math.round(worstTrade * 100) / 100,
+      wins: wins.length,
+      losses: losses.length,
+      expired: expired.length,
+      fibPerformance,
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/price', (req,res) => {
   if (cachedPrice.price) {
     return res.json({
@@ -487,10 +621,7 @@ app.get('/price', (req,res) => {
       age: Math.floor((Date.now()-cachedPrice.timestamp)/1000),
     });
   }
-  // No cache yet — try a single fetch
-  fetchLivePriceFromSource().then(p => {
-    res.json({ price: p, ticker: TICKER, cached: false });
-  });
+  fetchLivePriceFromSource().then(p => res.json({ price: p, ticker: TICKER, cached: false }));
 });
 
 app.get('/candles', async (req,res) => {
@@ -503,7 +634,7 @@ app.get('/candles', async (req,res) => {
 
 app.get('/news', async (req,res) => {
   try {
-    const q=encodeURIComponent('gold price XAU OR Federal Reserve interest rates OR Trump tariffs economy OR geopolitical risk gold OR inflation CPI dollar');
+    const q=encodeURIComponent('gold price XAU OR Federal Reserve interest rates OR inflation CPI dollar');
     const r=await axios.get(`https://newsapi.org/v2/everything?q=${q}&language=en&sortBy=publishedAt&pageSize=15&apiKey=${NEWS_API_KEY}`,{timeout:10000});
     if (!r.data?.articles) return res.json([]);
     res.json(r.data.articles.filter(a=>a.title&&a.title!=='[Removed]').map(a=>{
@@ -521,10 +652,10 @@ app.post('/webhook', express.json(), (req,res) => {
     const data=req.body;
     if (!data.action||!data.price||!data.ticker) return res.status(400).json({error:'Missing fields'});
     const confidence=parseInt(data.confidence)||0;
-    if (confidence<75) return res.json({filtered:true,reason:'Below quality threshold'});
+    if (confidence<75) return res.json({filtered:true});
     const tf=data.timeframe||'';
     const signal={ticker:data.ticker||'XAU/USD',action:data.action.toUpperCase(),price:parseFloat(data.price),sl:data.sl?parseFloat(data.sl):null,tp1:data.tp1?parseFloat(data.tp1):null,tp2:data.tp2?parseFloat(data.tp2):null,timeframe:tf,confidence,fib_level:data.fib_level||null,pattern:data.pattern||null,rsi:data.rsi?parseFloat(data.rsi):null,atr:data.atr?parseFloat(data.atr):null,current_price:parseFloat(data.price),entry_valid_for:tf.includes('H')?(tf==='1H'?2:8):24,mtf:JSON.stringify({h1:data.mtf?.h1||false,h4:data.mtf?.h4||false,d1:data.mtf?.d1||false}),timestamp:Date.now()};
-    db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp) VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp)`).run(signal);
+    db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome) VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')`).run(signal);
     sendSignalPush({...signal,id:db.prepare('SELECT last_insert_rowid() as id').get().id});
     res.json({success:true,signal});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -548,23 +679,9 @@ app.post('/autotrade/connect', express.json(), (req,res) => {
   res.json({success:true});
 });
 
-async function autoExecuteForAllAccounts(signal) {
-  try {
-    const accounts=db.prepare('SELECT * FROM autotrade_accounts WHERE auto_trade=1').all();
-    for (const account of accounts) {
-      try {
-        await axios.post(`${METAAPI_URL}/users/current/accounts/${account.account_id}/trade`,{actionType:signal.action==='BUY'?'ORDER_TYPE_BUY':'ORDER_TYPE_SELL',symbol:'XAUUSD',volume:account.lot_size||0.01,stopLoss:signal.sl,takeProfit:signal.tp1,comment:`Pulstrade ${signal.fib_level||''} ${signal.confidence||''}%`},{headers:{'auth-token':METAAPI_TOKEN},timeout:30000});
-      } catch(e) { console.error(`Auto trade failed ${account.account_id}:`,e.message); }
-    }
-  } catch(e) { console.error('Auto execute error:',e.message); }
-}
-
 app.get('/calendar', async (req, res) => {
-  try {
-    const now = new Date();
-    const events = generateWeeklyCalendar(now);
-    res.json(events);
-  } catch(e) { res.json(generateWeeklyCalendar(new Date())); }
+  try { res.json(generateWeeklyCalendar(new Date())); }
+  catch(e) { res.json([]); }
 });
 
 function generateWeeklyCalendar(now) {
@@ -572,59 +689,41 @@ function generateWeeklyCalendar(now) {
   const monday = new Date(now);
   monday.setUTCDate(now.getUTCDate() - (day === 0 ? 6 : day - 1));
   monday.setUTCHours(0,0,0,0);
-
   const getDay = (offset, hour, min) => {
     const d = new Date(monday);
     d.setUTCDate(monday.getUTCDate() + offset);
     d.setUTCHours(hour, min, 0, 0);
     return d.toISOString();
   };
-
   const allEvents = [
-    { title: 'EUR CPI Flash Estimate', currency: 'EUR', category: 'Inflation',    impact: 'high',   time: getDay(0, 10, 0),  forecast: '2.2%',  previous: '2.3%', actual: null },
-    { title: 'US ISM Manufacturing',   currency: 'USD', category: 'Business',     impact: 'medium', time: getDay(0, 15, 0),  forecast: '48.5',  previous: '47.8', actual: null },
-    { title: 'US CPI (MoM)',           currency: 'USD', category: 'Inflation',    impact: 'high',   time: getDay(1, 13, 30), forecast: '0.3%',  previous: '0.4%', actual: null },
-    { title: 'US CPI (YoY)',           currency: 'USD', category: 'Inflation',    impact: 'high',   time: getDay(1, 13, 30), forecast: '3.2%',  previous: '3.5%', actual: null },
-    { title: 'RBA Rate Decision',      currency: 'AUD', category: 'Central Bank', impact: 'medium', time: getDay(1, 3, 30),  forecast: '4.35%', previous: '4.35%', actual: null },
-    { title: 'FOMC Meeting Minutes',   currency: 'USD', category: 'Central Bank', impact: 'high',   time: getDay(2, 19, 0),  forecast: '—',     previous: '—',    actual: null },
-    { title: 'US PPI (MoM)',           currency: 'USD', category: 'Inflation',    impact: 'medium', time: getDay(2, 13, 30), forecast: '0.2%',  previous: '0.2%', actual: null },
-    { title: 'EIA Crude Oil Stocks',   currency: 'USD', category: 'Energy',       impact: 'medium', time: getDay(2, 15, 30), forecast: '-1.2M', previous: '2.1M', actual: null },
-    { title: 'US Jobless Claims',      currency: 'USD', category: 'Employment',   impact: 'medium', time: getDay(3, 13, 30), forecast: '215K',  previous: '210K', actual: null },
-    { title: 'ECB Rate Decision',      currency: 'EUR', category: 'Central Bank', impact: 'high',   time: getDay(3, 13, 15), forecast: '4.50%', previous: '4.50%', actual: null },
-    { title: 'US GDP (QoQ)',           currency: 'USD', category: 'Growth',       impact: 'high',   time: getDay(3, 13, 30), forecast: '2.1%',  previous: '3.1%', actual: null },
-    { title: 'US Non-Farm Payrolls',   currency: 'USD', category: 'Employment',   impact: 'high',   time: getDay(4, 13, 30), forecast: '185K',  previous: '175K', actual: null },
-    { title: 'US Unemployment Rate',   currency: 'USD', category: 'Employment',   impact: 'high',   time: getDay(4, 13, 30), forecast: '3.8%',  previous: '3.9%', actual: null },
-    { title: 'US Core PCE Price Index',currency: 'USD', category: 'Inflation',    impact: 'high',   time: getDay(4, 13, 30), forecast: '0.3%',  previous: '0.3%', actual: null },
-    { title: 'UoM Consumer Sentiment', currency: 'USD', category: 'Sentiment',    impact: 'medium', time: getDay(4, 15, 0),  forecast: '78.5',  previous: '76.9', actual: null },
+    { title: 'EUR CPI Flash Estimate', currency: 'EUR', category: 'Inflation', impact: 'high', time: getDay(0, 10, 0), forecast: '2.2%', previous: '2.3%', actual: null },
+    { title: 'US ISM Manufacturing', currency: 'USD', category: 'Business', impact: 'medium', time: getDay(0, 15, 0), forecast: '48.5', previous: '47.8', actual: null },
+    { title: 'US CPI (MoM)', currency: 'USD', category: 'Inflation', impact: 'high', time: getDay(1, 13, 30), forecast: '0.3%', previous: '0.4%', actual: null },
+    { title: 'FOMC Meeting Minutes', currency: 'USD', category: 'Central Bank', impact: 'high', time: getDay(2, 19, 0), forecast: '—', previous: '—', actual: null },
+    { title: 'US Jobless Claims', currency: 'USD', category: 'Employment', impact: 'medium', time: getDay(3, 13, 30), forecast: '215K', previous: '210K', actual: null },
+    { title: 'US Non-Farm Payrolls', currency: 'USD', category: 'Employment', impact: 'high', time: getDay(4, 13, 30), forecast: '185K', previous: '175K', actual: null },
+    { title: 'US Core PCE Price Index', currency: 'USD', category: 'Inflation', impact: 'high', time: getDay(4, 13, 30), forecast: '0.3%', previous: '0.3%', actual: null },
   ];
-
   const cutoff = new Date(now.getTime() - 24 * 3600000);
-  const filtered = allEvents.filter(e => new Date(e.time) >= cutoff).sort((a, b) => new Date(a.time) - new Date(b.time));
-
-  return filtered.map(e => {
+  return allEvents.filter(e => new Date(e.time) >= cutoff).sort((a, b) => new Date(a.time) - new Date(b.time)).map(e => {
     const eventTime = new Date(e.time);
     const diff = eventTime - now;
     const diffMin = Math.floor(diff / 60000);
-    const diffH   = Math.floor(diff / 3600000);
-    
+    const diffH = Math.floor(diff / 3600000);
     let timeLabel;
-    if (diff < 0 && diff > -3600000)     timeLabel = 'Just released';
-    else if (diff < 0)                    timeLabel = `${Math.abs(diffH)}h ago`;
-    else if (diffMin < 60)                timeLabel = `in ${diffMin}min ⚡`;
-    else if (diffH < 24)                  timeLabel = `Today ${eventTime.getUTCHours().toString().padStart(2,'0')}:${eventTime.getUTCMinutes().toString().padStart(2,'0')} UTC`;
+    if (diff < 0 && diff > -3600000) timeLabel = 'Just released';
+    else if (diff < 0) timeLabel = `${Math.abs(diffH)}h ago`;
+    else if (diffMin < 60) timeLabel = `in ${diffMin}min ⚡`;
+    else if (diffH < 24) timeLabel = `Today ${eventTime.getUTCHours().toString().padStart(2,'0')}:${eventTime.getUTCMinutes().toString().padStart(2,'0')} UTC`;
     else {
       const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
       timeLabel = `${days[eventTime.getUTCDay()]} ${eventTime.getUTCHours().toString().padStart(2,'0')}:${eventTime.getUTCMinutes().toString().padStart(2,'0')} UTC`;
     }
-
-    const isSoon = diff > 0 && diffMin <= 30;
-    const isPast = diff < 0;
-
-    return { ...e, timeLabel, isSoon, isPast, timestamp: eventTime.getTime() };
+    return { ...e, timeLabel, isSoon: diff > 0 && diffMin <= 30, isPast: diff < 0, timestamp: eventTime.getTime() };
   });
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────
 scanForSignals();
 setInterval(scanForSignals, 5*60*1000);
-app.listen(PORT, () => console.log(`Pulstrade backend v3.2 on port ${PORT} — with price caching`));
+app.listen(PORT, () => console.log(`Pulstrade backend v3.3 (real tracking) on port ${PORT}`));
