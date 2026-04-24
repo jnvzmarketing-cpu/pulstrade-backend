@@ -673,14 +673,18 @@ async function scanForSignals() {
           timestamp: Date.now(),
         };
 
-        db.prepare(`INSERT INTO signals
-          (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
-          VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
-        `).run(record);
-
-        console.log(`✓ [${sig.strategy}] ${sig.action} ${TICKER} @ ${sig.price} (${tf.label}, ${sig.confidence}%)`);
-        const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
-        sendSignalPush({ ...record, id: inserted.id });
+        try {
+          db.prepare(`INSERT INTO signals
+            (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
+            VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
+          `).run(record);
+          console.log(`✓ INSERTED [${sig.strategy}] ${sig.action} ${TICKER} @ ${sig.price} (${tf.label}, ${sig.confidence}%)`);
+          const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
+          sendSignalPush({ ...record, id: inserted.id });
+        } catch(dbErr) {
+          console.error(`❌ DB INSERT FAILED [${tf.label}] ${sig.action} ${sig.strategy}:`, dbErr.message);
+          console.error('Record was:', JSON.stringify(record));
+        }
       }
     } catch(err) {
       console.error(`Scanner error ${tf.label}:`, err.message);
@@ -750,7 +754,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.0-5m-timeframe' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.1-debug-insert' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -954,7 +958,83 @@ app.get('/scan-debug', async (req, res) => {
   res.json(results);
 });
 
+// ── DB CHECK — inspect schema and test insert ─────────────
+app.get('/db-check', (req, res) => {
+  try {
+    const columns = db.prepare("PRAGMA table_info(signals)").all();
+    const count = db.prepare("SELECT COUNT(*) as c FROM signals").get().c;
+    
+    // Try a test insert
+    let insertResult = 'not attempted';
+    try {
+      const testRecord = {
+        ticker: 'TEST', action: 'BUY', price: 1000,
+        sl: 990, tp1: 1010, tp2: 1020,
+        timeframe: 'TEST', confidence: 50, fib_level: null,
+        pattern: 'test', strategy: 'TEST', note: 'test',
+        rsi: 50, atr: 10, current_price: 1000, entry_valid_for: 1,
+        mtf: '{}', timestamp: Date.now(),
+      };
+      db.prepare(`INSERT INTO signals
+        (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
+        VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
+      `).run(testRecord);
+      // Delete the test
+      db.prepare("DELETE FROM signals WHERE ticker='TEST'").run();
+      insertResult = 'SUCCESS';
+    } catch(e) {
+      insertResult = 'FAILED: ' + e.message;
+    }
+    
+    res.json({
+      columns: columns.map(c => ({name: c.name, type: c.type})),
+      signalCount: count,
+      testInsert: insertResult,
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── FORCE SCAN — manually trigger scanner ──────────────────
+// ── DB CHECK — inspect schema and test insert ─────────────
+app.get('/db-check', (req, res) => {
+  try {
+    const columns = db.prepare("PRAGMA table_info(signals)").all();
+    const count = db.prepare("SELECT COUNT(*) as c FROM signals").get().c;
+    
+    // Try a test insert
+    let insertResult = 'not attempted';
+    try {
+      const testRecord = {
+        ticker: 'TEST', action: 'BUY', price: 1000,
+        sl: 990, tp1: 1010, tp2: 1020,
+        timeframe: 'TEST', confidence: 50, fib_level: null,
+        pattern: 'test', strategy: 'TEST', note: 'test',
+        rsi: 50, atr: 10, current_price: 1000, entry_valid_for: 1,
+        mtf: '{}', timestamp: Date.now(),
+      };
+      db.prepare(`INSERT INTO signals
+        (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,note,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome)
+        VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@note,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')
+      `).run(testRecord);
+      // Delete the test
+      db.prepare("DELETE FROM signals WHERE ticker='TEST'").run();
+      insertResult = 'SUCCESS';
+    } catch(e) {
+      insertResult = 'FAILED: ' + e.message;
+    }
+    
+    res.json({
+      columns: columns.map(c => ({name: c.name, type: c.type})),
+      signalCount: count,
+      testInsert: insertResult,
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── FORCE SCAN — manually trigger scanner ──────────────────
 app.get('/force-scan', async (req, res) => {
   const before = db.prepare('SELECT COUNT(*) as c FROM signals').get().c;
