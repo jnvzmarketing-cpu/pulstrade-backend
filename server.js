@@ -290,13 +290,15 @@ function scanFibPullback(candles, tf) {
     // SL/TP
     let sl, tp1, tp2;
     if (action==='BUY') {
-      sl  = Math.round((fibValue - atr*1.5)*100)/100;
+      sl  = Math.round((Math.min(fibValue, price) - atr*1.5)*100)/100;
       tp1 = Math.round((price + atr*3.0)*100)/100;
       tp2 = Math.round((price + atr*5.0)*100)/100;
+      if (sl >= price) continue; // safety
     } else {
-      sl  = Math.round((fibValue + atr*1.5)*100)/100;
+      sl  = Math.round((Math.max(fibValue, price) + atr*1.5)*100)/100;
       tp1 = Math.round((price - atr*3.0)*100)/100;
       tp2 = Math.round((price - atr*5.0)*100)/100;
+      if (sl <= price) continue; // safety
     }
 
     const rr = Math.abs(tp1-price) / Math.abs(price-sl);
@@ -556,9 +558,15 @@ function scanEmaPullback(candles, tf) {
       // Trend strength bonus
       if (price > ema200) { score += 10; reasons.push('Above EMA200: +10pts'); }
 
-      const sl = Math.round((Math.min(ema50, ema20) - atr * 2)*100)/100;
+      // SL must be BELOW current price for BUY
+      // Use the lowest relevant support (lower of ema20/ema50/recent low) minus ATR buffer
+      const recentLow = Math.min(...candles.slice(0, 10).map(c => c.low));
+      const slBase = Math.min(ema20, ema50, recentLow, price - atr * 1.5);
+      const sl = Math.round((slBase - atr * 0.5)*100)/100;
       const tp1 = Math.round((price + atr * 2.5)*100)/100;
       const tp2 = Math.round((price + atr * 4.5)*100)/100;
+      // Validate SL is below price (safety check)
+      if (sl >= price) continue;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
       if (rr >= 1.0 && score >= 30) {
@@ -594,9 +602,15 @@ function scanEmaPullback(candles, tf) {
 
       if (price < ema200) { score += 10; reasons.push('Below EMA200: +10pts'); }
 
-      const sl = Math.round((Math.max(ema50, ema20) + atr * 2)*100)/100;
+      // SL must be ABOVE current price for SELL
+      // Use the highest relevant resistance (higher of ema20/ema50/recent high) plus ATR buffer
+      const recentHigh = Math.max(...candles.slice(0, 10).map(c => c.high));
+      const slBase = Math.max(ema20, ema50, recentHigh, price + atr * 1.5);
+      const sl = Math.round((slBase + atr * 0.5)*100)/100;
       const tp1 = Math.round((price - atr * 2.5)*100)/100;
       const tp2 = Math.round((price - atr * 4.5)*100)/100;
+      // Validate SL is above price (safety check)
+      if (sl <= price) continue;
       const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
       if (rr >= 1.0 && score >= 30) {
@@ -756,7 +770,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.3-econ-fix' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.4-sl-fix' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
