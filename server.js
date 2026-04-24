@@ -559,15 +559,13 @@ function scanEmaPullback(candles, tf) {
       // Trend strength bonus
       if (price > ema200) { score += 10; reasons.push('Above EMA200: +10pts'); }
 
-      // SL must be BELOW current price for BUY
-      const recentLow = Math.min(...candles.slice(0, 10).map(c => c.low));
-      const slBase = Math.min(ema20, ema50, recentLow, price - atr * 1.5);
-      const sl = Math.round((slBase - atr * 0.5)*100)/100;
+      // SL always below price for BUY — simple and safe
+      const sl = Math.round((price - atr * 1.5) * 100) / 100;
       const tp1 = Math.round((price + atr * 2.5)*100)/100;
       const tp2 = Math.round((price + atr * 4.5)*100)/100;
-      const rr = sl < price ? Math.abs(tp1-price) / Math.abs(price-sl) : 0;
+      const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (sl < price && rr >= 1.0 && score >= 30) {
+      if (rr >= 1.0 && score >= 30) {
         signals.push({
           action: 'BUY', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -600,15 +598,13 @@ function scanEmaPullback(candles, tf) {
 
       if (price < ema200) { score += 10; reasons.push('Below EMA200: +10pts'); }
 
-      // SL must be ABOVE current price for SELL
-      const recentHigh = Math.max(...candles.slice(0, 10).map(c => c.high));
-      const slBase = Math.max(ema20, ema50, recentHigh, price + atr * 1.5);
-      const sl = Math.round((slBase + atr * 0.5)*100)/100;
+      // SL always above price for SELL — simple and safe
+      const sl = Math.round((price + atr * 1.5) * 100) / 100;
       const tp1 = Math.round((price - atr * 2.5)*100)/100;
       const tp2 = Math.round((price - atr * 4.5)*100)/100;
-      const rr = sl > price ? Math.abs(tp1-price) / Math.abs(price-sl) : 0;
+      const rr = Math.abs(tp1-price) / Math.abs(price-sl);
 
-      if (sl > price && rr >= 1.0 && score >= 30) {
+      if (rr >= 1.0 && score >= 30) {
         signals.push({
           action: 'SELL', price: Math.round(price*100)/100,
           sl, tp1, tp2,
@@ -765,7 +761,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.5-syntax-fix' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.6-simple-sl' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
