@@ -626,10 +626,11 @@ async function scanForSignals() {
   if (!cachedPrice.price) { console.log('⚠️ No live price'); return; }
 
   const timeframes = [
-    { label: '15m', interval: '15min', validFor: 0.5, minScore: 45 },
-    { label: '30m', interval: '30min', validFor: 1,   minScore: 48 },
-    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 50 },
-    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 48 },
+    { label: '5m',  interval: '5min',  validFor: 0.25, minScore: 55 },
+    { label: '15m', interval: '15min', validFor: 0.5,  minScore: 45 },
+    { label: '30m', interval: '30min', validFor: 1,    minScore: 48 },
+    { label: '1H',  interval: '1h',    validFor: 2,    minScore: 50 },
+    { label: '4H',  interval: '4h',    validFor: 8,    minScore: 48 },
   ];
 
   for (const tf of timeframes) {
@@ -749,7 +750,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.3.2-force-scan' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.0-5m-timeframe' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -758,7 +759,7 @@ app.get('/health', (req,res) => res.json({
   marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
   strategies: ['FIB', 'Range Bounce', 'Breakout', 'EMA Pullback'],
-  timeframes: ['15m', '30m', '1H', '4H'],
+  timeframes: ['5m', '15m', '30m', '1H', '4H'],
 }));
 
 app.get('/signals', (req,res) => {
@@ -913,10 +914,11 @@ app.post('/autotrade/connect', express.json(), (req,res) => {
 app.get('/scan-debug', async (req, res) => {
   const results = { timestamp: new Date().toISOString(), livePrice: cachedPrice.price, timeframes: {} };
   const timeframes = [
-    { label: '15m', interval: '15min', validFor: 0.5, minScore: 45 },
-    { label: '30m', interval: '30min', validFor: 1,   minScore: 48 },
-    { label: '1H',  interval: '1h',    validFor: 2,   minScore: 50 },
-    { label: '4H',  interval: '4h',    validFor: 8,   minScore: 48 },
+    { label: '5m',  interval: '5min',  validFor: 0.25, minScore: 55 },
+    { label: '15m', interval: '15min', validFor: 0.5,  minScore: 45 },
+    { label: '30m', interval: '30min', validFor: 1,    minScore: 48 },
+    { label: '1H',  interval: '1h',    validFor: 2,    minScore: 50 },
+    { label: '4H',  interval: '4h',    validFor: 8,    minScore: 48 },
   ];
 
   for (const tf of timeframes) {
