@@ -13,21 +13,19 @@ if (!admin.apps.length) {
   } catch(e) { console.warn('Firebase error:', e.message); }
 }
 
-async function sendSignalPush(signal) {
-  try {
-    if (!admin.apps.length) return;
-    const emoji = signal.action === 'BUY' ? '📈' : '📉';
-    const title = `${emoji} ${signal.action} Signal — XAU/USD`;
-    const body  = `${signal.strategy || 'FIB'} · Entry: $${signal.price} · ${signal.confidence || 0}% Confidence`;
-    await admin.messaging().send({
-      topic: 'signals',
-      notification: { title, body },
-      data: { action: signal.action, price: String(signal.price), confidence: String(signal.confidence || 0) },
-      apns: { payload: { aps: { sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
-      android: { priority: 'high', notification: { title, body, channelId: 'pulstrade_signals', priority: 'max' } },
-    });
-    console.log(`✓ Push: ${title}`);
-  } catch(e) { console.error('Push error:', e.message); }
+function sendSignalPush(signal) {
+  // Fire-and-forget — never blocks scanner
+  if (!admin.apps.length) return;
+  const emoji = signal.action === 'BUY' ? '📈' : '📉';
+  const title = `${emoji} ${signal.action} Signal — XAU/USD`;
+  const body  = `${signal.strategy || 'FIB'} · Entry: $${signal.price} · ${signal.confidence || 0}% Confidence`;
+  admin.messaging().send({
+    topic: 'signals',
+    notification: { title, body },
+    data: { action: signal.action, price: String(signal.price), confidence: String(signal.confidence || 0) },
+    apns: { payload: { aps: { sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
+    android: { priority: 'high', notification: { title, body, channelId: 'pulstrade_signals', priority: 'max' } },
+  }).then(() => console.log(`✓ Push: ${title}`)).catch(e => console.error('Push error:', e.message));
 }
 
 const app  = express();
@@ -680,7 +678,7 @@ async function scanForSignals() {
           `).run(record);
           console.log(`✓ INSERTED [${sig.strategy}] ${sig.action} ${TICKER} @ ${sig.price} (${tf.label}, ${sig.confidence}%)`);
           const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
-          sendSignalPush({ ...record, id: inserted.id });
+          try { sendSignalPush({ ...record, id: inserted.id }); } catch(pushErr) { console.error('Push call error:', pushErr.message); }
         } catch(dbErr) {
           console.error(`❌ DB INSERT FAILED [${tf.label}] ${sig.action} ${sig.strategy}:`, dbErr.message);
           console.error('Record was:', JSON.stringify(record));
@@ -754,7 +752,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.1-debug-insert' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.2-push-fixed' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -891,7 +889,7 @@ app.post('/webhook', express.json(), (req,res) => {
     const tf=data.timeframe||'';
     const signal={ticker:data.ticker||'XAU/USD',action:data.action.toUpperCase(),price:parseFloat(data.price),sl:data.sl?parseFloat(data.sl):null,tp1:data.tp1?parseFloat(data.tp1):null,tp2:data.tp2?parseFloat(data.tp2):null,timeframe:tf,confidence,fib_level:data.fib_level||null,pattern:data.pattern||null,strategy:'TradingView',rsi:data.rsi?parseFloat(data.rsi):null,atr:data.atr?parseFloat(data.atr):null,current_price:parseFloat(data.price),entry_valid_for:tf.includes('H')?(tf==='1H'?2:8):24,mtf:JSON.stringify({h1:data.mtf?.h1||false,h4:data.mtf?.h4||false,d1:data.mtf?.d1||false}),timestamp:Date.now()};
     db.prepare(`INSERT INTO signals (ticker,action,price,sl,tp1,tp2,timeframe,confidence,fib_level,pattern,strategy,rsi,atr,current_price,entry_valid_for,mtf,timestamp,outcome) VALUES (@ticker,@action,@price,@sl,@tp1,@tp2,@timeframe,@confidence,@fib_level,@pattern,@strategy,@rsi,@atr,@current_price,@entry_valid_for,@mtf,@timestamp,'open')`).run(signal);
-    sendSignalPush({...signal,id:db.prepare('SELECT last_insert_rowid() as id').get().id});
+    try { sendSignalPush({...signal,id:db.prepare('SELECT last_insert_rowid() as id').get().id}); } catch(e) {}
     res.json({success:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
