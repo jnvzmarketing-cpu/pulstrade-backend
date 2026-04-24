@@ -190,10 +190,12 @@ function calcBollingerBands(closes, period=20, std=2) {
   return { upper: mean+std*s, middle: mean, lower: mean-std*s };
 }
 
-function isEconomicEventSoon(offsetMin=30) {
+function isEconomicEventSoon(offsetMin=10) {
+  // Only block scanning 10 min before/after major US releases
+  // (was 30 min — too aggressive, blocked too much)
   const now = new Date();
   const total = now.getUTCHours()*60 + now.getUTCMinutes();
-  const events = [13*60+30, 15*60, 19*60, 14*60, 8*60+30];
+  const events = [13*60+30]; // Only NFP/CPI window 13:30 UTC
   return events.some(e => Math.abs(e - total) <= offsetMin);
 }
 
@@ -619,9 +621,11 @@ function scanEmaPullback(candles, tf) {
 // MAIN SCANNER — runs all strategies on all timeframes
 // ════════════════════════════════════════════════════════════════════════
 async function scanForSignals() {
-  if (isMarketClosed()) { console.log('Market closed'); return; }
-  if (isEconomicEventSoon(30)) { console.log('⚠️ Economic event'); return; }
-  if (!cachedPrice.price) { console.log('⚠️ No live price'); return; }
+  console.log('🔍 Scanner starting...');
+  if (isMarketClosed()) { console.log('❌ Market closed — abort'); return; }
+  if (isEconomicEventSoon(10)) { console.log('❌ Economic event window — abort'); return; }
+  if (!cachedPrice.price) { console.log('❌ No live price — abort'); return; }
+  console.log(`✓ Scanner running @ $${cachedPrice.price}`);
 
   const timeframes = [
     { label: '5m',  interval: '5min',  validFor: 0.25, minScore: 55 },
@@ -752,7 +756,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.2-push-fixed' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.3-econ-fix' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
