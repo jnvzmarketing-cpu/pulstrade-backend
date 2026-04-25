@@ -761,7 +761,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.6-simple-sl' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.7-test-push' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -998,6 +998,28 @@ app.get('/db-check', (req, res) => {
       signalCount: count,
       testInsert: insertResult,
     });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── TEST PUSH — manually send a test notification ─────────
+app.get('/test-push', async (req, res) => {
+  try {
+    if (!admin.apps.length) {
+      return res.status(500).json({ error: 'Firebase not configured. Set FIREBASE_SERVICE_ACCOUNT env variable.' });
+    }
+    const title = req.query.title || '📈 Test Signal';
+    const body  = req.query.body  || 'This is a test notification from Pulstrade backend';
+    
+    const result = await admin.messaging().send({
+      topic: 'signals',
+      notification: { title, body },
+      apns: { payload: { aps: { sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
+      android: { priority: 'high', notification: { title, body, channelId: 'pulstrade_signals', priority: 'max' } },
+    });
+    
+    res.json({ success: true, messageId: result, title, body });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
