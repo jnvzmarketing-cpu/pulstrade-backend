@@ -191,12 +191,9 @@ function calcBollingerBands(closes, period=20, std=2) {
 }
 
 function isEconomicEventSoon(offsetMin=10) {
-  // Only block scanning 10 min before/after major US releases
-  // (was 30 min — too aggressive, blocked too much)
-  const now = new Date();
-  const total = now.getUTCHours()*60 + now.getUTCMinutes();
-  const events = [13*60+30]; // Only NFP/CPI window 13:30 UTC
-  return events.some(e => Math.abs(e - total) <= offsetMin);
+  // DISABLED in v4.9.2 — was blocking too much
+  // Re-enable later when we have real economic calendar API
+  return false;
 }
 
 function isMarketClosed() {
@@ -1291,21 +1288,30 @@ async function scanForSignals() {
                             : [];
       const allSignals    = [...fibSignals, ...setup2Signals, ...setup3Signals];
 
+      console.log(`📦 [${tf.label}] Got ${allSignals.length} candidate signals`);
       for (const sig of allSignals) {
+        console.log(`  → Checking ${sig.action} ${sig.strategy} conf=${sig.confidence} fib=${sig.fib_level || 'n/a'}`);
+        
         // ── MTF CONSENSUS FILTER ──
         if (sig.action !== consensusDirection) {
-          console.log(`🚫 [${tf.label}] ${sig.action} ${sig.strategy} blocked — against MTF consensus (${consensusDirection})`);
+          console.log(`  🚫 BLOCKED: against MTF consensus (need ${consensusDirection})`);
           continue;
         }
         
         // Filter by minimum confidence
-        if (sig.confidence < tf.minScore) continue;
+        if (sig.confidence < tf.minScore) {
+          console.log(`  🚫 BLOCKED: confidence ${sig.confidence} < minScore ${tf.minScore}`);
+          continue;
+        }
 
         // Dedup check — no same action/strategy/TF in last 2h
         const recent = db.prepare(
           `SELECT id FROM signals WHERE ticker=? AND action=? AND strategy=? AND timeframe=? AND timestamp > ?`
         ).get(TICKER, sig.action, sig.strategy, tf.label, Date.now()-2*3600000);
-        if (recent) continue;
+        if (recent) {
+          console.log(`  🚫 BLOCKED: duplicate (same strategy/TF in last 2h, signal #${recent.id})`);
+          continue;
+        }
 
         const record = {
           ticker: TICKER,
@@ -1398,7 +1404,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.1-state-debug' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.2-econ-off' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
