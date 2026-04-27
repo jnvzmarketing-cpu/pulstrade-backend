@@ -933,6 +933,285 @@ function scanSetup2BreakoutRetest(candles, tf) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// SETUP 3: DOUBLE TOP / DOUBLE BOTTOM REJECTION (David's strategy)
+// State-Machine: First pivot → Second pivot in tolerance → EMA20 break = Signal
+// ════════════════════════════════════════════════════════════════════════
+
+// Constants
+const S3_PIVOT_LEFT = 5;
+const S3_PIVOT_RIGHT = 3;
+const S3_TOP_TOLERANCE_ATR = 0.5;
+const S3_MIN_BARS_BETWEEN = 5;
+const S3_MAX_BARS_BETWEEN = 30;
+const S3_MAX_BARS_TO_TRIGGER = 10;
+const S3_WICK_RATIO = 0.4;
+const S3_TP_MULTIPLIER = 1.5;
+const S3_SL_BUFFER_ATR = 0.1;
+const S3_EMA_TRIGGER_LEN = 20;
+
+// State per timeframe
+const setup3State = {
+  '5m': null,
+  '15m': null,
+};
+
+function freshSetup3State() {
+  return {
+    firstTop:        null,   // { price, barTimestamp, lowSinceTop }
+    firstBottom:     null,   // { price, barTimestamp, highSinceBottom }
+    secondTop:       null,
+    secondBottom:    null,
+    triggerArmedBarTimestamp: null,
+    lastSignalBarTimestamp:   null,
+  };
+}
+
+// Pivot detection: looks for confirmed pivot at index (length - right - 1)
+// candles array is NEWEST FIRST (index 0 = current bar)
+function detectPivotHighFromCandles(candles, left, right) {
+  // Convert to chronological order (oldest first) for cleaner indexing
+  const chrono = [...candles].reverse();
+  const pivotIdx = chrono.length - right - 1;
+  if (pivotIdx < left) return null;
+  
+  const candidate = chrono[pivotIdx];
+  for (let i = pivotIdx - left; i < pivotIdx; i++) {
+    if (chrono[i].high >= candidate.high) return null;
+  }
+  for (let i = pivotIdx + 1; i <= pivotIdx + right; i++) {
+    if (chrono[i].high >= candidate.high) return null;
+  }
+  
+  return {
+    price: candidate.high,
+    barTimestamp: candidate.timestamp,
+    upperWick: candidate.high - Math.max(candidate.open, candidate.close),
+    range: candidate.high - candidate.low,
+  };
+}
+
+function detectPivotLowFromCandles(candles, left, right) {
+  const chrono = [...candles].reverse();
+  const pivotIdx = chrono.length - right - 1;
+  if (pivotIdx < left) return null;
+  
+  const candidate = chrono[pivotIdx];
+  for (let i = pivotIdx - left; i < pivotIdx; i++) {
+    if (chrono[i].low <= candidate.low) return null;
+  }
+  for (let i = pivotIdx + 1; i <= pivotIdx + right; i++) {
+    if (chrono[i].low <= candidate.low) return null;
+  }
+  
+  return {
+    price: candidate.low,
+    barTimestamp: candidate.timestamp,
+    lowerWick: Math.min(candidate.open, candidate.close) - candidate.low,
+    range: candidate.high - candidate.low,
+  };
+}
+
+// Calculate bar distance between two timestamps in candle array
+function barsBetween(candles, ts1, ts2) {
+  const idx1 = candles.findIndex(c => c.timestamp === ts1);
+  const idx2 = candles.findIndex(c => c.timestamp === ts2);
+  if (idx1 < 0 || idx2 < 0) return -1;
+  return Math.abs(idx1 - idx2);
+}
+
+function scanSetup3DoubleTop(candles, tf) {
+  const signals = [];
+  if (!candles || candles.length < 250) return signals;
+  
+  const closes = candles.map(c => c.close);
+  const c0 = candles[0]; // newest
+  const c1 = candles[1]; // previous
+  if (!c0 || !c1) return signals;
+  
+  const atr = calcATR(candles);
+  const ema20 = calcEMA(closes, S3_EMA_TRIGGER_LEN);
+  if (!ema20 || !atr) return signals;
+  
+  // Get/init state
+  if (!setup3State[tf.label]) setup3State[tf.label] = freshSetup3State();
+  const state = setup3State[tf.label];
+  
+  // ─── Detect pivots ───
+  const ph = detectPivotHighFromCandles(candles, S3_PIVOT_LEFT, S3_PIVOT_RIGHT);
+  const pl = detectPivotLowFromCandles(candles, S3_PIVOT_LEFT, S3_PIVOT_RIGHT);
+  
+  const phHasWick = ph && ph.range > 0 && (ph.upperWick / ph.range) >= S3_WICK_RATIO;
+  const plHasWick = pl && pl.range > 0 && (pl.lowerWick / pl.range) >= S3_WICK_RATIO;
+  
+  // ═══════════════ DOUBLE TOP / SHORT SETUP ═══════════════
+  
+  if (ph && phHasWick) {
+    if (!state.firstTop) {
+      state.firstTop = { price: ph.price, barTimestamp: ph.barTimestamp, lowSinceTop: ph.price };
+      console.log(`📍 [${tf.label}] Setup 3: First TOP @ ${ph.price.toFixed(2)}`);
+    } else {
+      const barsSince = barsBetween(candles, state.firstTop.barTimestamp, ph.barTimestamp);
+      const priceDiff = Math.abs(ph.price - state.firstTop.price);
+      const tolerance = atr * S3_TOP_TOLERANCE_ATR;
+      
+      if (barsSince >= S3_MIN_BARS_BETWEEN && barsSince <= S3_MAX_BARS_BETWEEN && priceDiff <= tolerance) {
+        // Valid second top → arm trigger
+        state.secondTop = { price: ph.price, barTimestamp: ph.barTimestamp };
+        state.triggerArmedBarTimestamp = c0.timestamp;
+        console.log(`🎯 [${tf.label}] Setup 3: DOUBLE TOP confirmed @ ${ph.price.toFixed(2)} (1st: ${state.firstTop.price.toFixed(2)}) — armed`);
+      } else if (barsSince > S3_MAX_BARS_BETWEEN) {
+        // Reset, this becomes new first
+        state.firstTop = { price: ph.price, barTimestamp: ph.barTimestamp, lowSinceTop: ph.price };
+        state.secondTop = null;
+        state.triggerArmedBarTimestamp = null;
+      } else {
+        // Within window but doesn't match → update first
+        state.firstTop = { price: ph.price, barTimestamp: ph.barTimestamp, lowSinceTop: ph.price };
+      }
+    }
+  }
+  
+  // Track lowest point since first top
+  if (state.firstTop && c0.low < state.firstTop.lowSinceTop) {
+    state.firstTop.lowSinceTop = c0.low;
+  }
+  
+  // Check for SHORT trigger
+  if (state.secondTop && state.triggerArmedBarTimestamp) {
+    const barsSinceArm = barsBetween(candles, state.triggerArmedBarTimestamp, c0.timestamp);
+    
+    if (barsSinceArm > S3_MAX_BARS_TO_TRIGGER) {
+      console.log(`⏰ [${tf.label}] Setup 3: SHORT trigger expired (${barsSinceArm} bars without EMA break)`);
+      state.secondTop = null;
+      state.triggerArmedBarTimestamp = null;
+      // Keep firstTop in case a new pattern develops
+    } else if (barsSinceArm >= 1 && c0.close < ema20 && c1.close >= ema20) {
+      // EMA20 break to downside on this bar
+      const topHigh = Math.max(state.firstTop.price, state.secondTop.price);
+      const middleLow = state.firstTop.lowSinceTop;
+      const measuredMove = topHigh - middleLow;
+      
+      if (measuredMove > 0) {
+        const entry = c0.close;
+        const sl = topHigh + (atr * S3_SL_BUFFER_ATR);
+        const tp1 = entry - (measuredMove * S3_TP_MULTIPLIER);
+        const tp2 = entry - (measuredMove * 2.5);
+        
+        // Validate SL > entry > tp1 (correct SELL geometry)
+        if (sl > entry && tp1 < entry) {
+          const rr = (entry - tp1) / (sl - entry);
+          if (rr >= 1.0) {
+            signals.push({
+              action: 'SELL',
+              price: Math.round(entry * 100) / 100,
+              sl: Math.round(sl * 100) / 100,
+              tp1: Math.round(tp1 * 100) / 100,
+              tp2: Math.round(tp2 * 100) / 100,
+              confidence: 80,
+              fib_level: null,
+              pattern: 'Double Top + EMA20 Break',
+              strategy: 'Setup 3 Double Top',
+              note: `Tops: ${state.firstTop.price.toFixed(2)} & ${state.secondTop.price.toFixed(2)} | Move: ${measuredMove.toFixed(2)} | RR ${rr.toFixed(2)}`,
+              rsi: calcRSI(closes),
+              atr,
+            });
+            console.log(`✅ [${tf.label}] Setup 3 SELL @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
+          }
+        }
+        
+        // Reset state — signal fired
+        state.firstTop = null;
+        state.secondTop = null;
+        state.triggerArmedBarTimestamp = null;
+        state.lastSignalBarTimestamp = c0.timestamp;
+        return signals;
+      }
+    }
+  }
+  
+  // ═══════════════ DOUBLE BOTTOM / LONG SETUP ═══════════════
+  
+  if (pl && plHasWick) {
+    if (!state.firstBottom) {
+      state.firstBottom = { price: pl.price, barTimestamp: pl.barTimestamp, highSinceBottom: pl.price };
+      console.log(`📍 [${tf.label}] Setup 3: First BOTTOM @ ${pl.price.toFixed(2)}`);
+    } else {
+      const barsSince = barsBetween(candles, state.firstBottom.barTimestamp, pl.barTimestamp);
+      const priceDiff = Math.abs(pl.price - state.firstBottom.price);
+      const tolerance = atr * S3_TOP_TOLERANCE_ATR;
+      
+      if (barsSince >= S3_MIN_BARS_BETWEEN && barsSince <= S3_MAX_BARS_BETWEEN && priceDiff <= tolerance) {
+        state.secondBottom = { price: pl.price, barTimestamp: pl.barTimestamp };
+        state.triggerArmedBarTimestamp = c0.timestamp;
+        console.log(`🎯 [${tf.label}] Setup 3: DOUBLE BOTTOM confirmed @ ${pl.price.toFixed(2)} (1st: ${state.firstBottom.price.toFixed(2)}) — armed`);
+      } else if (barsSince > S3_MAX_BARS_BETWEEN) {
+        state.firstBottom = { price: pl.price, barTimestamp: pl.barTimestamp, highSinceBottom: pl.price };
+        state.secondBottom = null;
+        state.triggerArmedBarTimestamp = null;
+      } else {
+        state.firstBottom = { price: pl.price, barTimestamp: pl.barTimestamp, highSinceBottom: pl.price };
+      }
+    }
+  }
+  
+  // Track highest point since first bottom
+  if (state.firstBottom && c0.high > state.firstBottom.highSinceBottom) {
+    state.firstBottom.highSinceBottom = c0.high;
+  }
+  
+  // Check for LONG trigger
+  if (state.secondBottom && state.triggerArmedBarTimestamp) {
+    const barsSinceArm = barsBetween(candles, state.triggerArmedBarTimestamp, c0.timestamp);
+    
+    if (barsSinceArm > S3_MAX_BARS_TO_TRIGGER) {
+      console.log(`⏰ [${tf.label}] Setup 3: LONG trigger expired`);
+      state.secondBottom = null;
+      state.triggerArmedBarTimestamp = null;
+    } else if (barsSinceArm >= 1 && c0.close > ema20 && c1.close <= ema20) {
+      const bottomLow = Math.min(state.firstBottom.price, state.secondBottom.price);
+      const middleHigh = state.firstBottom.highSinceBottom;
+      const measuredMove = middleHigh - bottomLow;
+      
+      if (measuredMove > 0) {
+        const entry = c0.close;
+        const sl = bottomLow - (atr * S3_SL_BUFFER_ATR);
+        const tp1 = entry + (measuredMove * S3_TP_MULTIPLIER);
+        const tp2 = entry + (measuredMove * 2.5);
+        
+        if (sl < entry && tp1 > entry) {
+          const rr = (tp1 - entry) / (entry - sl);
+          if (rr >= 1.0) {
+            signals.push({
+              action: 'BUY',
+              price: Math.round(entry * 100) / 100,
+              sl: Math.round(sl * 100) / 100,
+              tp1: Math.round(tp1 * 100) / 100,
+              tp2: Math.round(tp2 * 100) / 100,
+              confidence: 80,
+              fib_level: null,
+              pattern: 'Double Bottom + EMA20 Break',
+              strategy: 'Setup 3 Double Bottom',
+              note: `Bottoms: ${state.firstBottom.price.toFixed(2)} & ${state.secondBottom.price.toFixed(2)} | Move: ${measuredMove.toFixed(2)} | RR ${rr.toFixed(2)}`,
+              rsi: calcRSI(closes),
+              atr,
+            });
+            console.log(`✅ [${tf.label}] Setup 3 BUY @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
+          }
+        }
+        
+        state.firstBottom = null;
+        state.secondBottom = null;
+        state.triggerArmedBarTimestamp = null;
+        state.lastSignalBarTimestamp = c0.timestamp;
+        return signals;
+      }
+    }
+  }
+  
+  return signals;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // MAIN SCANNER — runs all strategies on all timeframes
 // ════════════════════════════════════════════════════════════════════════
 async function scanForSignals() {
@@ -1001,13 +1280,16 @@ async function scanForSignals() {
         if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles`); continue; }
       }
 
-      // Active strategies: FIB Pullback + Setup 2 (Breakout + Retest)
-      // Setup 2 only on 5m and 15m (David's preferred TFs for breakout trades)
+      // Active strategies: FIB Pullback + Setup 2 (Breakout+Retest) + Setup 3 (Double Top/Bottom)
+      // Setup 2 & 3 only on 5m and 15m (David's preferred TFs)
       const fibSignals    = scanFibPullback(candles, tf);
       const setup2Signals = (tf.label === '5m' || tf.label === '15m') 
                             ? scanSetup2BreakoutRetest(candles, tf) 
                             : [];
-      const allSignals    = [...fibSignals, ...setup2Signals];
+      const setup3Signals = (tf.label === '5m' || tf.label === '15m')
+                            ? scanSetup3DoubleTop(candles, tf)
+                            : [];
+      const allSignals    = [...fibSignals, ...setup2Signals, ...setup3Signals];
 
       for (const sig of allSignals) {
         // ── MTF CONSENSUS FILTER ──
@@ -1116,7 +1398,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.8.0-setup2' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.0-setup3' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -1124,7 +1406,7 @@ app.get('/health', (req,res) => res.json({
   closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
   marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
-  strategies: ['FIB Pullback', 'Setup 2 Breakout+Retest'],
+  strategies: ['FIB Pullback', 'Setup 2 Breakout+Retest', 'Setup 3 Double Top/Bottom'],
   timeframes: ['5m', '15m', '30m', '1H', '4H'],
 }));
 
