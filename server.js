@@ -698,6 +698,241 @@ function scanEmaPullback(candles, tf) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// SETUP 2: AGGRESSIVE BREAKOUT + RETEST (David's strategy)
+// State-Machine implementation matching pulstrade_setup2_v4_1.pine
+// ════════════════════════════════════════════════════════════════════════
+
+// State per timeframe — persisted in memory between scans
+const setup2State = {
+  '5m': null,
+  '15m': null,
+};
+
+function freshState() {
+  return {
+    aggBreakLevel: null,
+    aggCandleLow:  null,
+    aggCandleHigh: null,
+    aggRangeSize:  null,
+    aggBar:        null,    // candle timestamp when aggressive candle fired
+    aggIsBull:     null,
+    retestDone:    false,
+    retestBar:     null,
+  };
+}
+
+// SMA helper (Pine SMA equivalent)
+function calcSMA(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(0, period);
+  return slice.reduce((a,b) => a+b, 0) / period;
+}
+
+// CVD calculation (cumulative volume delta over candles, oldest first)
+function calcCVD(candles) {
+  // candles[0] is newest; reverse for chronological order
+  const chrono = [...candles].reverse();
+  const cvdSeries = [];
+  let cum = 0;
+  for (const c of chrono) {
+    const vol = c.volume || 1; // Twelve Data Forex = tick volume = always 1+, fallback 1
+    const delta = c.close >= c.open ? vol : -vol;
+    cum += delta;
+    cvdSeries.push(cum);
+  }
+  // Most recent CVD value
+  const cvdNow = cvdSeries[cvdSeries.length - 1];
+  // SMA of last 20 CVD values
+  const last20 = cvdSeries.slice(-20);
+  const cvdMA = last20.length >= 5 ? last20.reduce((a,b) => a+b, 0) / last20.length : cvdNow;
+  return { cvdNow, cvdMA, cvdBullish: cvdNow > cvdMA, cvdBearish: cvdNow < cvdMA };
+}
+
+function scanSetup2BreakoutRetest(candles, tf) {
+  const signals = [];
+  if (!candles || candles.length < 220) return signals;
+  
+  const closes = candles.map(c => c.close);
+  const highs  = candles.map(c => c.high);
+  const lows   = candles.map(c => c.low);
+  const opens  = candles.map(c => c.open);
+  
+  // Current candle (newest)
+  const c0 = candles[0];
+  const c1 = candles[1];
+  const price = c0.close;
+  const open0 = c0.open;
+  
+  const atr = calcATR(candles);
+  const ema200 = calcEMA(closes, 200);
+  const sma200 = calcSMA(closes, 200);
+  if (!ema200 || !sma200) return signals;
+  
+  // ── Get or initialize state for this timeframe ──
+  if (!setup2State[tf.label]) setup2State[tf.label] = freshState();
+  const state = setup2State[tf.label];
+  
+  // ── 1. ACCUMULATION RANGE CHECK ──
+  // Last 20 bars (excluding current)
+  const rangeWindow = candles.slice(1, 21);
+  if (rangeWindow.length < 20) return signals;
+  const rangeHigh = Math.max(...rangeWindow.map(c => c.high));
+  const rangeLow  = Math.min(...rangeWindow.map(c => c.low));
+  const rangeSize = rangeHigh - rangeLow;
+  const isAccumulation = rangeSize <= atr * 2.0;
+  
+  // ── 2. AGGRESSIVE CANDLE DETECTION ──
+  const body0 = Math.abs(c0.close - c0.open);
+  const isAggressive = body0 >= atr * 1.5;
+  
+  // Bullish breakout: prev bar below MAs, current bar broke above + bullish body
+  const bullishBreak = isAccumulation && isAggressive
+    && c1.close < ema200 && c1.close < sma200
+    && c0.close > ema200 && c0.close > sma200
+    && c0.close > c0.open;
+  
+  // Bearish breakdown: prev bar above MAs, current bar broke below + bearish body
+  const bearishBreak = isAccumulation && isAggressive
+    && c1.close > ema200 && c1.close > sma200
+    && c0.close < ema200 && c0.close < sma200
+    && c0.close < c0.open;
+  
+  // ── If new aggressive candle detected, RESET state ──
+  if (bullishBreak || bearishBreak) {
+    state.aggBreakLevel = bullishBreak ? rangeHigh : rangeLow;
+    state.aggCandleLow  = c0.low;
+    state.aggCandleHigh = c0.high;
+    state.aggRangeSize  = rangeSize;
+    state.aggBar        = c0.timestamp;
+    state.aggIsBull     = bullishBreak;
+    state.retestDone    = false;
+    state.retestBar     = null;
+    console.log(`💥 [${tf.label}] Setup 2: Aggressive ${bullishBreak ? 'BULL' : 'BEAR'} candle detected @ ${c0.close.toFixed(2)}`);
+    return signals; // Setup just started, no signal yet
+  }
+  
+  // ── 3. RETEST DETECTION (only if we have an aggressive candle pending) ──
+  if (state.aggBar && !state.retestDone) {
+    // Find how many bars since aggressive candle
+    const barsSinceAgg = candles.findIndex(c => c.timestamp <= state.aggBar);
+    
+    if (barsSinceAgg < 0 || barsSinceAgg > 15) {
+      // Setup expired — reset
+      console.log(`⏰ [${tf.label}] Setup 2: Aggressive candle expired (no retest in 15 bars)`);
+      setup2State[tf.label] = freshState();
+      return signals;
+    }
+    
+    const retestTolerance = atr * 0.3;
+    const breakLevel = state.aggBreakLevel;
+    
+    if (state.aggIsBull) {
+      // Bull retest: price must come down to break level
+      if (c0.low <= breakLevel + retestTolerance && c0.low >= breakLevel - retestTolerance) {
+        state.retestDone = true;
+        state.retestBar = c0.timestamp;
+        console.log(`🔄 [${tf.label}] Setup 2: BULL retest hit @ ${c0.low.toFixed(2)} (level: ${breakLevel.toFixed(2)})`);
+      }
+    } else {
+      // Bear retest: price must come up to break level
+      if (c0.high >= breakLevel - retestTolerance && c0.high <= breakLevel + retestTolerance) {
+        state.retestDone = true;
+        state.retestBar = c0.timestamp;
+        console.log(`🔄 [${tf.label}] Setup 2: BEAR retest hit @ ${c0.high.toFixed(2)} (level: ${breakLevel.toFixed(2)})`);
+      }
+    }
+  }
+  
+  // ── 4. TRIGGER CANDLE (only if retest is done) ──
+  if (state.aggBar && state.retestDone && state.retestBar) {
+    const barsSinceRetest = candles.findIndex(c => c.timestamp <= state.retestBar);
+    
+    if (barsSinceRetest < 0 || barsSinceRetest > 5) {
+      // Setup expired — reset
+      console.log(`⏰ [${tf.label}] Setup 2: Retest expired (no trigger in 5 bars)`);
+      setup2State[tf.label] = freshState();
+      return signals;
+    }
+    
+    // CVD check
+    const cvd = calcCVD(candles);
+    
+    if (state.aggIsBull) {
+      // Long trigger: bullish close + (optional) CVD bullish
+      const bullishClose = c0.close > c0.open;
+      const cvdOK = !state.cvdRequired || cvd.cvdBullish; // We'll honor CVD for now but allow override
+      
+      if (bullishClose && cvd.cvdBullish) {
+        const entry = c0.close;
+        const sl = state.aggCandleLow - atr * 0.1;
+        const tp1 = state.aggBreakLevel + (state.aggRangeSize * 1.5);
+        const tp2 = state.aggBreakLevel + (state.aggRangeSize * 2.5);
+        
+        // Validate SL placement
+        if (sl < entry && tp1 > entry) {
+          const rr = (tp1 - entry) / (entry - sl);
+          if (rr >= 1.0) {
+            signals.push({
+              action: 'BUY',
+              price: Math.round(entry * 100) / 100,
+              sl: Math.round(sl * 100) / 100,
+              tp1: Math.round(tp1 * 100) / 100,
+              tp2: Math.round(tp2 * 100) / 100,
+              confidence: 80,
+              fib_level: null,
+              pattern: 'Aggressive Bull Break + Retest',
+              strategy: 'Setup 2 Breakout+Retest',
+              note: `Range: ${state.aggRangeSize.toFixed(2)} | TP = Break + Range×1.5 | RR ${rr.toFixed(2)}`,
+              rsi: calcRSI(closes),
+              atr,
+            });
+            console.log(`✅ [${tf.label}] Setup 2 BUY @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
+          }
+        }
+        // Reset state — setup fired
+        setup2State[tf.label] = freshState();
+        return signals;
+      }
+    } else {
+      // Short trigger: bearish close + CVD bearish
+      const bearishClose = c0.close < c0.open;
+      
+      if (bearishClose && cvd.cvdBearish) {
+        const entry = c0.close;
+        const sl = state.aggCandleHigh + atr * 0.1;
+        const tp1 = state.aggBreakLevel - (state.aggRangeSize * 1.5);
+        const tp2 = state.aggBreakLevel - (state.aggRangeSize * 2.5);
+        
+        if (sl > entry && tp1 < entry) {
+          const rr = (entry - tp1) / (sl - entry);
+          if (rr >= 1.0) {
+            signals.push({
+              action: 'SELL',
+              price: Math.round(entry * 100) / 100,
+              sl: Math.round(sl * 100) / 100,
+              tp1: Math.round(tp1 * 100) / 100,
+              tp2: Math.round(tp2 * 100) / 100,
+              confidence: 80,
+              fib_level: null,
+              pattern: 'Aggressive Bear Break + Retest',
+              strategy: 'Setup 2 Breakout+Retest',
+              note: `Range: ${state.aggRangeSize.toFixed(2)} | TP = Break - Range×1.5 | RR ${rr.toFixed(2)}`,
+              rsi: calcRSI(closes),
+              atr,
+            });
+            console.log(`✅ [${tf.label}] Setup 2 SELL @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
+          }
+        }
+        setup2State[tf.label] = freshState();
+        return signals;
+      }
+    }
+  }
+  
+  return signals;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // MAIN SCANNER — runs all strategies on all timeframes
 // ════════════════════════════════════════════════════════════════════════
 async function scanForSignals() {
@@ -766,12 +1001,13 @@ async function scanForSignals() {
         if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles`); continue; }
       }
 
-      // Only FIB Pullback active — David's primary strategy with 3+ confirmations required
+      // Active strategies: FIB Pullback + Setup 2 (Breakout + Retest)
+      // Setup 2 only on 5m and 15m (David's preferred TFs for breakout trades)
       const fibSignals    = scanFibPullback(candles, tf);
-      // const rangeSignals  = scanRangeBounce(candles, tf);   // disabled v4.7
-      // const breakoutSigs  = scanBreakout(candles, tf);      // disabled v4.7
-      // const emaSignals    = scanEmaPullback(candles, tf);   // disabled v4.7
-      const allSignals    = [...fibSignals];
+      const setup2Signals = (tf.label === '5m' || tf.label === '15m') 
+                            ? scanSetup2BreakoutRetest(candles, tf) 
+                            : [];
+      const allSignals    = [...fibSignals, ...setup2Signals];
 
       for (const sig of allSignals) {
         // ── MTF CONSENSUS FILTER ──
@@ -880,7 +1116,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.7.0-fib-only' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.8.0-setup2' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -888,7 +1124,7 @@ app.get('/health', (req,res) => res.json({
   closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
   marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
-  strategies: ['FIB'],  // Other strategies disabled in v4.7 — FIB-only mode
+  strategies: ['FIB Pullback', 'Setup 2 Breakout+Retest'],
   timeframes: ['5m', '15m', '30m', '1H', '4H'],
 }));
 
@@ -1116,9 +1352,10 @@ app.get('/scan-debug', async (req, res) => {
       const atr = calcATR(candles);
       
       const fibSignals    = scanFibPullback(candles, tf);
-      const rangeSignals  = scanRangeBounce(candles, tf);
-      const breakoutSigs  = scanBreakout(candles, tf);
-      const emaSignals    = scanEmaPullback(candles, tf);
+      // Other strategies disabled in v4.7 — FIB only
+      const rangeSignals  = [];
+      const breakoutSigs  = [];
+      const emaSignals    = [];
       
       results.timeframes[tf.label] = {
         price: price.toFixed(2),
