@@ -350,14 +350,24 @@ function scanFibPullback(candles, tf) {
       }
     }
 
-    // ── REQUIRE 3+ CONFIRMATIONS ──
-    // FIB level is implicit (already filtered). Count rsi/ema/pattern/bb/momentum
+    // ── SMART CONFIRMATION FILTER ──
+    // Need either:
+    //   (A) 3+ confirmations total
+    //   (B) 2 confirmations AND at least 1 "premium" signal (Engulfing/Pin Bar or BB Extreme)
     const validConfirmations = [rsiConfirmed, emaConfirmed, patternConfirmed, bbConfirmed, momentumConfirmed].filter(Boolean).length;
     
-    if (validConfirmations < 3) {
-      console.log(`🚫 [${tf.label}] ${action} ${fibName} blocked — only ${validConfirmations}/5 confirmations (need 3+)`);
+    // Premium = strong pattern (Engulfing or Pin Bar score >= 18) OR Bollinger Band extreme
+    const hasPremiumSignal = patternConfirmed || bbConfirmed;
+    
+    const passes = (validConfirmations >= 3) || (validConfirmations >= 2 && hasPremiumSignal);
+    
+    if (!passes) {
+      console.log(`🚫 [${tf.label}] ${action} ${fibName} blocked — ${validConfirmations}/5 confirmations, premium=${hasPremiumSignal}`);
       continue;
     }
+    
+    // Tag setup quality
+    const setupQuality = validConfirmations >= 3 ? 'A+' : 'A';
 
     // SL/TP
     let sl, tp1, tp2;
@@ -383,10 +393,10 @@ function scanFibPullback(candles, tf) {
       fib_level: fibName,
       pattern: pattern.name,
       strategy: 'FIB',
-      note: `${validConfirmations}/5 confirmations | ${confirmations.slice(0,3).join(' | ')}`,
+      note: `${setupQuality} setup (${validConfirmations}/5${hasPremiumSignal ? ', premium' : ''}) | ${confirmations.slice(0,3).join(' | ')}`,
       rsi, atr,
     });
-    console.log(`✅ [${tf.label}] ${action} ${fibName} — ${validConfirmations}/5 confirmations (${confirmations.length} reasons)`);
+    console.log(`✅ [${tf.label}] ${setupQuality} ${action} ${fibName} — ${validConfirmations}/5 confirmations${hasPremiumSignal ? ' + PREMIUM' : ''}`);
   }
 
   return signals;
@@ -1404,7 +1414,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.2-econ-off' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.3-smart-filter' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
