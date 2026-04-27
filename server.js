@@ -956,6 +956,38 @@ const S3_TP_MULTIPLIER = 1.5;
 const S3_SL_BUFFER_ATR = 0.1;
 const S3_EMA_TRIGGER_LEN = 20;
 
+// EMA200 Slope Filter — only fire Setup 3 if trend is exhausted (flat)
+const S3_SLOPE_LOOKBACK = 10;              // bars for slope measurement
+const S3_SLOPE_FLAT_THRESHOLD = 0.05;      // EMA200 max % change over lookback
+const S3_EMA_SLOPE_LEN = 200;
+
+// Calculate EMA200 slope as % change over last N bars
+// Returns null if not enough history
+function calcEMA200Slope(candles, lookback) {
+  // candles is newest-first, length should be >= 200 + lookback
+  if (candles.length < S3_EMA_SLOPE_LEN + lookback + 5) return null;
+  
+  const closes = candles.map(c => c.close);
+  
+  // EMA200 of full series (most recent value)
+  const ema_now = calcEMA(closes, S3_EMA_SLOPE_LEN);
+  
+  // EMA200 of series shifted by `lookback` bars (skip newest N candles)
+  // candles is newest-first, so .slice(lookback) drops the newest N
+  const closes_past = candles.slice(lookback).map(c => c.close);
+  const ema_past = calcEMA(closes_past, S3_EMA_SLOPE_LEN);
+  
+  if (!ema_now || !ema_past || ema_past === 0) return null;
+  
+  const slopePct = ((ema_now - ema_past) / ema_past) * 100;
+  
+  return {
+    slopePct,
+    magnitude: Math.abs(slopePct),
+    isFlat: Math.abs(slopePct) < S3_SLOPE_FLAT_THRESHOLD,
+  };
+}
+
 // State per timeframe
 const setup3State = {
   '5m': null,
@@ -1043,6 +1075,12 @@ function scanSetup3DoubleTop(candles, tf) {
   if (!setup3State[tf.label]) setup3State[tf.label] = freshSetup3State();
   const state = setup3State[tf.label];
   
+  // ═══ EMA200 SLOPE FILTER ═══
+  // Setup 3 only fires when trend is exhausted (flat EMA200)
+  // Strong trends → reversal unlikely → block signals
+  const slope = calcEMA200Slope(candles, S3_SLOPE_LOOKBACK);
+  const trendIsExhausted = slope ? slope.isFlat : false;
+  
   // ─── Detect pivots ───
   const ph = detectPivotHighFromCandles(candles, S3_PIVOT_LEFT, S3_PIVOT_RIGHT);
   const pl = detectPivotLowFromCandles(candles, S3_PIVOT_LEFT, S3_PIVOT_RIGHT);
@@ -1092,8 +1130,10 @@ function scanSetup3DoubleTop(candles, tf) {
       state.secondTop = null;
       state.triggerArmedBarTimestamp = null;
       // Keep firstTop in case a new pattern develops
-    } else if (barsSinceArm >= 1 && c0.close < ema20 && c1.close >= ema20) {
-      // EMA20 break to downside on this bar
+    } else if (barsSinceArm >= 1 && c0.close < ema20 && c1.close >= ema20 && !trendIsExhausted) {
+      console.log(`🚫 [${tf.label}] Setup 3 SHORT trigger blocked — EMA200 slope ${slope?.slopePct.toFixed(3)}% (need <${S3_SLOPE_FLAT_THRESHOLD}%)`);
+    } else if (barsSinceArm >= 1 && c0.close < ema20 && c1.close >= ema20 && trendIsExhausted) {
+      // EMA20 break to downside on this bar + trend exhausted
       const topHigh = Math.max(state.firstTop.price, state.secondTop.price);
       const middleLow = state.firstTop.lowSinceTop;
       const measuredMove = topHigh - middleLow;
@@ -1174,7 +1214,9 @@ function scanSetup3DoubleTop(candles, tf) {
       console.log(`⏰ [${tf.label}] Setup 3: LONG trigger expired`);
       state.secondBottom = null;
       state.triggerArmedBarTimestamp = null;
-    } else if (barsSinceArm >= 1 && c0.close > ema20 && c1.close <= ema20) {
+    } else if (barsSinceArm >= 1 && c0.close > ema20 && c1.close <= ema20 && !trendIsExhausted) {
+      console.log(`🚫 [${tf.label}] Setup 3 LONG trigger blocked — EMA200 slope ${slope?.slopePct.toFixed(3)}% (need <${S3_SLOPE_FLAT_THRESHOLD}%)`);
+    } else if (barsSinceArm >= 1 && c0.close > ema20 && c1.close <= ema20 && trendIsExhausted) {
       const bottomLow = Math.min(state.firstBottom.price, state.secondBottom.price);
       const middleHigh = state.firstBottom.highSinceBottom;
       const measuredMove = middleHigh - bottomLow;
@@ -1414,7 +1456,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.3-smart-filter' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.0.0-slope-filter' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -1628,11 +1670,27 @@ app.get('/trend-consensus', async (req, res) => {
 });
 
 // ── STRATEGY STATE — inspect state machines ──────────────
-app.get('/strategy-state', (req, res) => {
+app.get('/strategy-state', async (req, res) => {
+  // Calculate current slope for both 5m and 15m
+  const slopes = {};
+  for (const tf of [{label:'5m',interval:'5min'}, {label:'15m',interval:'15min'}]) {
+    try {
+      const c = await fetchCandles(tf.interval, 220);
+      const slope = calcEMA200Slope(c, S3_SLOPE_LOOKBACK);
+      slopes[tf.label] = slope ? {
+        slopePct: parseFloat(slope.slopePct.toFixed(3)),
+        magnitude: parseFloat(slope.magnitude.toFixed(3)),
+        isFlat: slope.isFlat,
+        threshold: S3_SLOPE_FLAT_THRESHOLD,
+        setup3Allowed: slope.isFlat,
+      } : null;
+    } catch(e) { slopes[tf.label] = { error: e.message }; }
+  }
   res.json({
     setup2: setup2State,
     setup3: setup3State,
-    note: 'State per timeframe — null means no active setup pending',
+    slopes,
+    note: 'setup3Allowed = true means EMA200 is flat enough → Setup 3 can fire if pivots align',
   });
 });
 
