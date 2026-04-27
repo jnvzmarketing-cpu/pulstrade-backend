@@ -871,34 +871,28 @@ function scanSetup2BreakoutRetest(candles, tf) {
       
       if (bullishClose && cvd.cvdBullish) {
         const entry = c0.close;
-        const sl = state.aggCandleLow - atr * 0.1;
-        const tp1 = state.aggBreakLevel + (state.aggRangeSize * 1.5);
-        const tp2 = state.aggBreakLevel + (state.aggRangeSize * 2.5);
+        const originalSL = state.aggCandleLow - atr * 0.1;
+        const originalTP = state.aggBreakLevel + (state.aggRangeSize * 1.5);
         
-        // Validate SL placement
-        if (sl < entry && tp1 > entry) {
-          const rr = (tp1 - entry) / (entry - sl);
-          if (rr >= 1.0) {
-            signals.push({
-              action: 'BUY',
-              price: Math.round(entry * 100) / 100,
-              sl: Math.round(sl * 100) / 100,
-              tp1: Math.round(tp1 * 100) / 100,
-              tp2: Math.round(tp2 * 100) / 100,
-              confidence: 80,
-              fib_level: null,
-              pattern: 'Aggressive Bull Break + Retest',
-              strategy: 'Setup 2 Breakout+Retest',
-              note: `Range: ${state.aggRangeSize.toFixed(2)} | TP = Break + Range×1.5 | RR ${rr.toFixed(2)}`,
-              rsi: calcRSI(closes),
-              atr,
-            });
-            console.log(`✅ [${tf.label}] Setup 2 BUY @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
-          }
+        if (originalSL < entry && originalTP > entry) {
+          // ARM instead of fire — wait for confirmation
+          armedSignals[tf.label] = {
+            direction: 'BUY',
+            armBarTimestamp: c0.timestamp,
+            armPrice: entry,
+            armLow: c0.low,
+            armHigh: c0.high,
+            originalSL, originalTP,
+            atrSnapshot: atr,
+            confidence: 80,
+            strategy: 'Setup 2 Breakout+Retest',
+            pattern: 'Aggressive Bull Break + Retest',
+            fibLevel: null,
+          };
+          console.log(`🎯 [${tf.label}] Setup 2 BUY ARMED @ ${entry.toFixed(2)} — waiting for confirmation`);
         }
-        // Reset state — setup fired
         setup2State[tf.label] = freshState();
-        return signals;
+        return signals; // no immediate signal
       }
     } else {
       // Short trigger: bearish close + CVD bearish
@@ -906,29 +900,24 @@ function scanSetup2BreakoutRetest(candles, tf) {
       
       if (bearishClose && cvd.cvdBearish) {
         const entry = c0.close;
-        const sl = state.aggCandleHigh + atr * 0.1;
-        const tp1 = state.aggBreakLevel - (state.aggRangeSize * 1.5);
-        const tp2 = state.aggBreakLevel - (state.aggRangeSize * 2.5);
+        const originalSL = state.aggCandleHigh + atr * 0.1;
+        const originalTP = state.aggBreakLevel - (state.aggRangeSize * 1.5);
         
-        if (sl > entry && tp1 < entry) {
-          const rr = (entry - tp1) / (sl - entry);
-          if (rr >= 1.0) {
-            signals.push({
-              action: 'SELL',
-              price: Math.round(entry * 100) / 100,
-              sl: Math.round(sl * 100) / 100,
-              tp1: Math.round(tp1 * 100) / 100,
-              tp2: Math.round(tp2 * 100) / 100,
-              confidence: 80,
-              fib_level: null,
-              pattern: 'Aggressive Bear Break + Retest',
-              strategy: 'Setup 2 Breakout+Retest',
-              note: `Range: ${state.aggRangeSize.toFixed(2)} | TP = Break - Range×1.5 | RR ${rr.toFixed(2)}`,
-              rsi: calcRSI(closes),
-              atr,
-            });
-            console.log(`✅ [${tf.label}] Setup 2 SELL @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
-          }
+        if (originalSL > entry && originalTP < entry) {
+          armedSignals[tf.label] = {
+            direction: 'SELL',
+            armBarTimestamp: c0.timestamp,
+            armPrice: entry,
+            armLow: c0.low,
+            armHigh: c0.high,
+            originalSL, originalTP,
+            atrSnapshot: atr,
+            confidence: 80,
+            strategy: 'Setup 2 Breakout+Retest',
+            pattern: 'Aggressive Bear Break + Retest',
+            fibLevel: null,
+          };
+          console.log(`🎯 [${tf.label}] Setup 2 SELL ARMED @ ${entry.toFixed(2)} — waiting for confirmation`);
         }
         setup2State[tf.label] = freshState();
         return signals;
@@ -960,6 +949,173 @@ const S3_EMA_TRIGGER_LEN = 20;
 const S3_SLOPE_LOOKBACK = 10;              // bars for slope measurement
 const S3_SLOPE_FLAT_THRESHOLD = 0.05;      // EMA200 max % change over lookback
 const S3_EMA_SLOPE_LEN = 200;
+
+// ════════════════════════════════════════════════════════════════════════
+// CONFIRMATION DELAY (applies to Setup 2 + Setup 3)
+// Wait for liquidity sweep + stabilization before firing signal
+// ════════════════════════════════════════════════════════════════════════
+const CONFIRM_MIN_PULLBACK_ATR = 0.3;   // min counter-move (stop-hunt depth)
+const CONFIRM_MAX_PULLBACK_ATR = 1.5;   // max — beyond this = real reversal, invalid
+const CONFIRM_TIMEOUT_BARS     = 5;     // max bars to wait for confirmation
+const CONFIRM_SL_BUFFER_ATR    = 0.1;   // SL buffer beyond sweep extreme
+
+// Per-timeframe armed-signal state (separate from setup states)
+const armedSignals = {
+  '5m':  null,
+  '15m': null,
+};
+
+// Process armed signal: check timeout / invalidation / confirmation
+// Returns: confirmed signal object (to push), or null (still waiting / invalidated)
+function processArmedSignal(candles, tf) {
+  const armed = armedSignals[tf.label];
+  if (!armed) return null;
+  
+  const c0 = candles[0];
+  const atr = calcATR(candles);
+  if (!atr) return null;
+  
+  // How many bars since arming?
+  const armBarIdx = candles.findIndex(c => c.timestamp === armed.armBarTimestamp);
+  // armBarIdx is 0 if same bar, 1 if previous, etc.
+  const barsSinceArm = armBarIdx >= 0 ? armBarIdx : 999;
+  
+  // ─── TIMEOUT ───
+  if (barsSinceArm > CONFIRM_TIMEOUT_BARS) {
+    console.log(`⏰ [${tf.label}] Armed ${armed.direction} signal timeout — discarded`);
+    armedSignals[tf.label] = null;
+    return null;
+  }
+  
+  // ─── BUY CONFIRMATION ───
+  if (armed.direction === 'BUY') {
+    // Track lowest point seen since arming (across all bars from arm to now)
+    const sinceArm = candles.slice(0, armBarIdx + 1);
+    const lowestSinceArm = Math.min(...sinceArm.map(c => c.low));
+    armed.armLow = Math.min(armed.armLow, lowestSinceArm);
+    
+    const pullback = armed.armPrice - armed.armLow;
+    
+    // Invalidation: pullback exceeded original SL
+    if (armed.armLow < armed.originalSL) {
+      console.log(`🚫 [${tf.label}] Armed BUY invalidated — pullback exceeded original SL`);
+      armedSignals[tf.label] = null;
+      return null;
+    }
+    
+    // Invalidation: pullback too deep (real reversal, not stop-hunt)
+    if (pullback > armed.atrSnapshot * CONFIRM_MAX_PULLBACK_ATR) {
+      console.log(`🚫 [${tf.label}] Armed BUY invalidated — pullback ${pullback.toFixed(2)} > max ${(armed.atrSnapshot * CONFIRM_MAX_PULLBACK_ATR).toFixed(2)}`);
+      armedSignals[tf.label] = null;
+      return null;
+    }
+    
+    // Confirmation conditions
+    const sufficientPullback   = pullback >= armed.atrSnapshot * CONFIRM_MIN_PULLBACK_ATR;
+    const bullishClose         = c0.close > c0.open;
+    const closeAboveArmPrice   = c0.close >= armed.armPrice - (armed.atrSnapshot * 0.2);
+    const minBarSinceArm       = barsSinceArm >= 1;
+    
+    if (sufficientPullback && bullishClose && closeAboveArmPrice && minBarSinceArm) {
+      // CONFIRMED — fire signal with better levels
+      const newSL = armed.armLow - (atr * CONFIRM_SL_BUFFER_ATR);
+      const slDistance = c0.close - newSL;
+      const tpDistance = armed.originalTP - c0.close;
+      
+      if (slDistance <= 0 || tpDistance <= 0) {
+        console.log(`🚫 [${tf.label}] Armed BUY skipped — invalid SL/TP geometry after confirm`);
+        armedSignals[tf.label] = null;
+        return null;
+      }
+      
+      const newRR = tpDistance / slDistance;
+      
+      const signal = {
+        action: 'BUY',
+        price: Math.round(c0.close * 100) / 100,
+        sl: Math.round(newSL * 100) / 100,
+        tp1: Math.round(armed.originalTP * 100) / 100,
+        tp2: Math.round((armed.originalTP + (armed.originalTP - c0.close) * 0.6) * 100) / 100,
+        confidence: Math.min(85, armed.confidence + 5), // small boost for confirmed setup
+        fib_level: armed.fibLevel || null,
+        pattern: armed.pattern + ' (Liquidity Sweep Confirmed)',
+        strategy: armed.strategy,
+        note: `CONFIRMED after ${barsSinceArm}-bar sweep | RR ${newRR.toFixed(2)} | sweep low ${armed.armLow.toFixed(2)}`,
+        rsi: calcRSI(candles.map(c => c.close)),
+        atr,
+      };
+      
+      console.log(`✅ [${tf.label}] CONFIRMED ${armed.strategy} BUY @ ${c0.close.toFixed(2)} | SL ${newSL.toFixed(2)} | RR ${newRR.toFixed(2)} (sweep ${armed.armLow.toFixed(2)})`);
+      armedSignals[tf.label] = null;
+      return signal;
+    }
+    
+    return null; // still waiting
+  }
+  
+  // ─── SELL CONFIRMATION ───
+  if (armed.direction === 'SELL') {
+    const sinceArm = candles.slice(0, armBarIdx + 1);
+    const highestSinceArm = Math.max(...sinceArm.map(c => c.high));
+    armed.armHigh = Math.max(armed.armHigh, highestSinceArm);
+    
+    const pullback = armed.armHigh - armed.armPrice;
+    
+    if (armed.armHigh > armed.originalSL) {
+      console.log(`🚫 [${tf.label}] Armed SELL invalidated — pullback exceeded original SL`);
+      armedSignals[tf.label] = null;
+      return null;
+    }
+    
+    if (pullback > armed.atrSnapshot * CONFIRM_MAX_PULLBACK_ATR) {
+      console.log(`🚫 [${tf.label}] Armed SELL invalidated — pullback ${pullback.toFixed(2)} > max ${(armed.atrSnapshot * CONFIRM_MAX_PULLBACK_ATR).toFixed(2)}`);
+      armedSignals[tf.label] = null;
+      return null;
+    }
+    
+    const sufficientPullback   = pullback >= armed.atrSnapshot * CONFIRM_MIN_PULLBACK_ATR;
+    const bearishClose         = c0.close < c0.open;
+    const closeBelowArmPrice   = c0.close <= armed.armPrice + (armed.atrSnapshot * 0.2);
+    const minBarSinceArm       = barsSinceArm >= 1;
+    
+    if (sufficientPullback && bearishClose && closeBelowArmPrice && minBarSinceArm) {
+      const newSL = armed.armHigh + (atr * CONFIRM_SL_BUFFER_ATR);
+      const slDistance = newSL - c0.close;
+      const tpDistance = c0.close - armed.originalTP;
+      
+      if (slDistance <= 0 || tpDistance <= 0) {
+        console.log(`🚫 [${tf.label}] Armed SELL skipped — invalid SL/TP geometry`);
+        armedSignals[tf.label] = null;
+        return null;
+      }
+      
+      const newRR = tpDistance / slDistance;
+      
+      const signal = {
+        action: 'SELL',
+        price: Math.round(c0.close * 100) / 100,
+        sl: Math.round(newSL * 100) / 100,
+        tp1: Math.round(armed.originalTP * 100) / 100,
+        tp2: Math.round((armed.originalTP - (c0.close - armed.originalTP) * 0.6) * 100) / 100,
+        confidence: Math.min(85, armed.confidence + 5),
+        fib_level: armed.fibLevel || null,
+        pattern: armed.pattern + ' (Liquidity Sweep Confirmed)',
+        strategy: armed.strategy,
+        note: `CONFIRMED after ${barsSinceArm}-bar sweep | RR ${newRR.toFixed(2)} | sweep high ${armed.armHigh.toFixed(2)}`,
+        rsi: calcRSI(candles.map(c => c.close)),
+        atr,
+      };
+      
+      console.log(`✅ [${tf.label}] CONFIRMED ${armed.strategy} SELL @ ${c0.close.toFixed(2)} | SL ${newSL.toFixed(2)} | RR ${newRR.toFixed(2)} (sweep ${armed.armHigh.toFixed(2)})`);
+      armedSignals[tf.label] = null;
+      return signal;
+    }
+    
+    return null;
+  }
+  
+  return null;
+}
 
 // Calculate EMA200 slope as % change over last N bars
 // Returns null if not enough history
@@ -1146,27 +1302,23 @@ function scanSetup3DoubleTop(candles, tf) {
         
         // Validate SL > entry > tp1 (correct SELL geometry)
         if (sl > entry && tp1 < entry) {
-          const rr = (entry - tp1) / (sl - entry);
-          if (rr >= 1.0) {
-            signals.push({
-              action: 'SELL',
-              price: Math.round(entry * 100) / 100,
-              sl: Math.round(sl * 100) / 100,
-              tp1: Math.round(tp1 * 100) / 100,
-              tp2: Math.round(tp2 * 100) / 100,
-              confidence: 80,
-              fib_level: null,
-              pattern: 'Double Top + EMA20 Break',
-              strategy: 'Setup 3 Double Top',
-              note: `Tops: ${state.firstTop.price.toFixed(2)} & ${state.secondTop.price.toFixed(2)} | Move: ${measuredMove.toFixed(2)} | RR ${rr.toFixed(2)}`,
-              rsi: calcRSI(closes),
-              atr,
-            });
-            console.log(`✅ [${tf.label}] Setup 3 SELL @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
-          }
+          armedSignals[tf.label] = {
+            direction: 'SELL',
+            armBarTimestamp: c0.timestamp,
+            armPrice: entry,
+            armLow: c0.low,
+            armHigh: c0.high,
+            originalSL: sl,
+            originalTP: tp1,
+            atrSnapshot: atr,
+            confidence: 80,
+            strategy: 'Setup 3 Double Top',
+            pattern: 'Double Top + EMA20 Break',
+            fibLevel: null,
+          };
+          console.log(`🎯 [${tf.label}] Setup 3 SELL ARMED @ ${entry.toFixed(2)} — waiting for confirmation`);
         }
         
-        // Reset state — signal fired
         state.firstTop = null;
         state.secondTop = null;
         state.triggerArmedBarTimestamp = null;
@@ -1228,24 +1380,21 @@ function scanSetup3DoubleTop(candles, tf) {
         const tp2 = entry + (measuredMove * 2.5);
         
         if (sl < entry && tp1 > entry) {
-          const rr = (tp1 - entry) / (entry - sl);
-          if (rr >= 1.0) {
-            signals.push({
-              action: 'BUY',
-              price: Math.round(entry * 100) / 100,
-              sl: Math.round(sl * 100) / 100,
-              tp1: Math.round(tp1 * 100) / 100,
-              tp2: Math.round(tp2 * 100) / 100,
-              confidence: 80,
-              fib_level: null,
-              pattern: 'Double Bottom + EMA20 Break',
-              strategy: 'Setup 3 Double Bottom',
-              note: `Bottoms: ${state.firstBottom.price.toFixed(2)} & ${state.secondBottom.price.toFixed(2)} | Move: ${measuredMove.toFixed(2)} | RR ${rr.toFixed(2)}`,
-              rsi: calcRSI(closes),
-              atr,
-            });
-            console.log(`✅ [${tf.label}] Setup 3 BUY @ ${entry.toFixed(2)} | SL ${sl.toFixed(2)} | TP1 ${tp1.toFixed(2)}`);
-          }
+          armedSignals[tf.label] = {
+            direction: 'BUY',
+            armBarTimestamp: c0.timestamp,
+            armPrice: entry,
+            armLow: c0.low,
+            armHigh: c0.high,
+            originalSL: sl,
+            originalTP: tp1,
+            atrSnapshot: atr,
+            confidence: 80,
+            strategy: 'Setup 3 Double Bottom',
+            pattern: 'Double Bottom + EMA20 Break',
+            fibLevel: null,
+          };
+          console.log(`🎯 [${tf.label}] Setup 3 BUY ARMED @ ${entry.toFixed(2)} — waiting for confirmation`);
         }
         
         state.firstBottom = null;
@@ -1329,8 +1478,13 @@ async function scanForSignals() {
         if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles`); continue; }
       }
 
-      // Active strategies: FIB Pullback + Setup 2 (Breakout+Retest) + Setup 3 (Double Top/Bottom)
-      // Setup 2 & 3 only on 5m and 15m (David's preferred TFs)
+      // ═══ Process armed signals first (Setup 2 + 3 confirmation delay) ═══
+      const confirmedSignal = (tf.label === '5m' || tf.label === '15m')
+                              ? processArmedSignal(candles, tf)
+                              : null;
+      
+      // Active strategies: FIB Pullback + Setup 2 + Setup 3
+      // Setup 2 & 3 only on 5m and 15m
       const fibSignals    = scanFibPullback(candles, tf);
       const setup2Signals = (tf.label === '5m' || tf.label === '15m') 
                             ? scanSetup2BreakoutRetest(candles, tf) 
@@ -1338,7 +1492,8 @@ async function scanForSignals() {
       const setup3Signals = (tf.label === '5m' || tf.label === '15m')
                             ? scanSetup3DoubleTop(candles, tf)
                             : [];
-      const allSignals    = [...fibSignals, ...setup2Signals, ...setup3Signals];
+      // Confirmed signal goes through (already passed all checks)
+      const allSignals    = [...fibSignals, ...setup2Signals, ...setup3Signals, ...(confirmedSignal ? [confirmedSignal] : [])];
 
       console.log(`📦 [${tf.label}] Got ${allSignals.length} candidate signals`);
       for (const sig of allSignals) {
@@ -1456,7 +1611,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.0.0-slope-filter' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.1.0-confirm-delay' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -1671,7 +1826,6 @@ app.get('/trend-consensus', async (req, res) => {
 
 // ── STRATEGY STATE — inspect state machines ──────────────
 app.get('/strategy-state', async (req, res) => {
-  // Calculate current slope for both 5m and 15m
   const slopes = {};
   for (const tf of [{label:'5m',interval:'5min'}, {label:'15m',interval:'15min'}]) {
     try {
@@ -1689,8 +1843,12 @@ app.get('/strategy-state', async (req, res) => {
   res.json({
     setup2: setup2State,
     setup3: setup3State,
+    armedSignals,
     slopes,
-    note: 'setup3Allowed = true means EMA200 is flat enough → Setup 3 can fire if pivots align',
+    notes: {
+      setup3Allowed: 'true means EMA200 is flat enough → Setup 3 can fire if pivots align',
+      armedSignals: 'Triggered setups waiting for confirmation (liquidity sweep + stabilization)',
+    },
   });
 });
 
