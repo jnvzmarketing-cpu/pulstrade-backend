@@ -223,7 +223,7 @@ function detectPattern(candles, action) {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// STRATEGY 1: FIB PULLBACK (Trend markets)
+// STRATEGY 1: FIB PULLBACK (Trend markets) — REQUIRES 3+ CONFIRMATIONS
 // ════════════════════════════════════════════════════════════════════════
 function scanFibPullback(candles, tf) {
   const closes = candles.map(c => c.close);
@@ -255,37 +255,112 @@ function scanFibPullback(candles, tf) {
 
   const signals = [];
 
+  // Calculate Bollinger Bands once
+  const bb = calcBollingerBands(closes);
+
   for (const [fibName, fibValue] of Object.entries(fibs)) {
-    const tolerance = atr * 2.5;
+    // CONFIRMATION 1: Price near FIB level (TIGHTER — was 2.5, now 1.5)
+    const tolerance = atr * 1.5;
     if (Math.abs(price - fibValue) > tolerance) continue;
 
     const action = uptrend ? 'BUY' : 'SELL';
-    // Relaxed zone: price in lower/upper 70% of range (was 55%)
-    const isBuyZone  = price < swingLow  + fibRange * 0.70;
-    const isSellZone = price > swingHigh - fibRange * 0.70;
+
+    // CONFIRMATION 2: Price in correct zone (TIGHTER — was 70%, now 50%)
+    const isBuyZone  = price < swingLow  + fibRange * 0.50;
+    const isSellZone = price > swingHigh - fibRange * 0.50;
     if (action==='BUY'  && !isBuyZone)  continue;
     if (action==='SELL' && !isSellZone) continue;
 
-    // Scoring
+    // Now count VALID CONFIRMATIONS — need 3+
+    const confirmations = [];
     let score = 0;
-    const reasons = [];
 
+    // CONF 1: FIB Level itself (always counts since we passed the check)
     const fibScores = { '61.8%':25, '50.0%':20, '38.2%':18, '78.6%':15 };
-    score += fibScores[fibName] || 10;
-    reasons.push(`FIB ${fibName}: +${fibScores[fibName]||10}pts`);
+    const fibPts = fibScores[fibName] || 10;
+    score += fibPts;
+    confirmations.push(`FIB ${fibName}: +${fibPts}pts`);
 
-    if (action==='BUY' && rsi >= 25 && rsi <= 50) { score += 20; reasons.push('RSI oversold: +20pts'); }
-    else if (action==='SELL' && rsi >= 50 && rsi <= 75) { score += 20; reasons.push('RSI overbought: +20pts'); }
-    else { score += 5; reasons.push(`RSI neutral: +5pts`); }
+    // CONF 2: Strong RSI position (NOT neutral)
+    let rsiConfirmed = false;
+    if (action==='BUY' && rsi >= 25 && rsi <= 45) {
+      score += 20;
+      confirmations.push(`RSI oversold ${rsi}: +20pts`);
+      rsiConfirmed = true;
+    } else if (action==='SELL' && rsi >= 55 && rsi <= 75) {
+      score += 20;
+      confirmations.push(`RSI overbought ${rsi}: +20pts`);
+      rsiConfirmed = true;
+    } else if (action==='BUY' && rsi < 25) {
+      score += 25;
+      confirmations.push(`RSI extreme oversold ${rsi}: +25pts`);
+      rsiConfirmed = true;
+    } else if (action==='SELL' && rsi > 75) {
+      score += 25;
+      confirmations.push(`RSI extreme overbought ${rsi}: +25pts`);
+      rsiConfirmed = true;
+    }
 
-    // Trend confirmation
-    if (action==='BUY' && price > ema50) { score += 15; reasons.push('Above EMA50: +15pts'); }
-    if (action==='SELL' && price < ema50) { score += 15; reasons.push('Below EMA50: +15pts'); }
+    // CONF 3: Trend confirmation via EMA50
+    let emaConfirmed = false;
+    if (action==='BUY' && price > ema50) {
+      score += 15;
+      confirmations.push('Above EMA50: +15pts');
+      emaConfirmed = true;
+    } else if (action==='SELL' && price < ema50) {
+      score += 15;
+      confirmations.push('Below EMA50: +15pts');
+      emaConfirmed = true;
+    }
 
-    // Pattern
+    // CONF 4: Bullish/Bearish Pattern (Pin Bar, Engulfing, etc.)
     const pattern = detectPattern(candles, action);
-    score += pattern.score;
-    if (pattern.score > 0) reasons.push(`${pattern.name}: +${pattern.score}pts`);
+    let patternConfirmed = false;
+    if (pattern.score >= 18) { // Only strong patterns count
+      score += pattern.score;
+      confirmations.push(`${pattern.name}: +${pattern.score}pts`);
+      patternConfirmed = true;
+    } else if (pattern.score > 0) {
+      score += pattern.score; // weak pattern adds points but doesn't count as confirmation
+    }
+
+    // CONF 5: Bollinger Band position
+    let bbConfirmed = false;
+    if (bb) {
+      if (action==='BUY' && price <= bb.lower * 1.005) {
+        score += 15;
+        confirmations.push('At BB Lower: +15pts');
+        bbConfirmed = true;
+      } else if (action==='SELL' && price >= bb.upper * 0.995) {
+        score += 15;
+        confirmations.push('At BB Upper: +15pts');
+        bbConfirmed = true;
+      }
+    }
+
+    // CONF 6: Strong candle (>60% body of range — momentum confirmation)
+    const c0 = candles[0];
+    const candleBody = Math.abs(c0.close - c0.open);
+    const candleRange = c0.high - c0.low;
+    let momentumConfirmed = false;
+    if (candleRange > 0 && candleBody / candleRange > 0.6) {
+      const isBullishCandle = c0.close > c0.open;
+      const isBearishCandle = c0.close < c0.open;
+      if ((action==='BUY' && isBullishCandle) || (action==='SELL' && isBearishCandle)) {
+        score += 10;
+        confirmations.push('Strong momentum candle: +10pts');
+        momentumConfirmed = true;
+      }
+    }
+
+    // ── REQUIRE 3+ CONFIRMATIONS ──
+    // FIB level is implicit (already filtered). Count rsi/ema/pattern/bb/momentum
+    const validConfirmations = [rsiConfirmed, emaConfirmed, patternConfirmed, bbConfirmed, momentumConfirmed].filter(Boolean).length;
+    
+    if (validConfirmations < 3) {
+      console.log(`🚫 [${tf.label}] ${action} ${fibName} blocked — only ${validConfirmations}/5 confirmations (need 3+)`);
+      continue;
+    }
 
     // SL/TP
     let sl, tp1, tp2;
@@ -299,7 +374,6 @@ function scanFibPullback(candles, tf) {
       tp2 = Math.round((price - atr*5.0)*100)/100;
     }
 
-    // Safety check — skip invalid SL placement
     if (action==='BUY' && sl >= price) continue;
     if (action==='SELL' && sl <= price) continue;
     const rr = Math.abs(tp1-price) / Math.abs(price-sl);
@@ -312,9 +386,10 @@ function scanFibPullback(candles, tf) {
       fib_level: fibName,
       pattern: pattern.name,
       strategy: 'FIB',
-      note: reasons.slice(0,3).join(' | '),
+      note: `${validConfirmations}/5 confirmations | ${confirmations.slice(0,3).join(' | ')}`,
       rsi, atr,
     });
+    console.log(`✅ [${tf.label}] ${action} ${fibName} — ${validConfirmations}/5 confirmations (${confirmations.length} reasons)`);
   }
 
   return signals;
@@ -640,6 +715,44 @@ async function scanForSignals() {
     { label: '4H',  interval: '4h',    validFor: 8,    minScore: 48 },
   ];
 
+  // ── MULTI-TIMEFRAME CONSENSUS CHECK ─────────────────────
+  // Calculate trend across ALL timeframes first
+  const trendVotes = { UP: 0, DOWN: 0, NEUTRAL: 0 };
+  const tfTrends = {};
+  
+  for (const tf of timeframes) {
+    try {
+      const tfCandles = await fetchCandles(tf.interval, 220);
+      if (!tfCandles || tfCandles.length < 50) continue;
+      const tfCloses = tfCandles.map(c => c.close);
+      const tfEma50 = calcEMA(tfCloses, 50);
+      const tfEma200 = calcEMA(tfCloses, 200);
+      
+      let trend = 'NEUTRAL';
+      if (tfEma50 && tfEma200) {
+        if (tfEma50 > tfEma200) trend = 'UP';
+        else if (tfEma50 < tfEma200) trend = 'DOWN';
+      }
+      tfTrends[tf.label] = trend;
+      trendVotes[trend]++;
+    } catch(e) { tfTrends[tf.label] = 'ERROR'; }
+  }
+  
+  console.log(`📊 Trend Consensus: UP=${trendVotes.UP} DOWN=${trendVotes.DOWN} NEUTRAL=${trendVotes.NEUTRAL} | ${JSON.stringify(tfTrends)}`);
+  
+  // Determine consensus direction (at least 3 of 5 TFs must agree)
+  const CONSENSUS_THRESHOLD = 3;
+  let consensusDirection = null;
+  if (trendVotes.UP >= CONSENSUS_THRESHOLD) consensusDirection = 'BUY';
+  else if (trendVotes.DOWN >= CONSENSUS_THRESHOLD) consensusDirection = 'SELL';
+  
+  if (!consensusDirection) {
+    console.log(`⚠️ No clear MTF consensus — skipping all signals (need ${CONSENSUS_THRESHOLD}/5 agreement)`);
+    return;
+  }
+  
+  console.log(`✅ MTF Consensus: ${consensusDirection} (${consensusDirection === 'BUY' ? trendVotes.UP : trendVotes.DOWN}/5 timeframes)`);
+
   for (const tf of timeframes) {
     try {
       const candles = await fetchCandles(tf.interval, 220);
@@ -661,6 +774,12 @@ async function scanForSignals() {
       const allSignals    = [...fibSignals, ...rangeSignals, ...breakoutSigs, ...emaSignals];
 
       for (const sig of allSignals) {
+        // ── MTF CONSENSUS FILTER ──
+        if (sig.action !== consensusDirection) {
+          console.log(`🚫 [${tf.label}] ${sig.action} ${sig.strategy} blocked — against MTF consensus (${consensusDirection})`);
+          continue;
+        }
+        
         // Filter by minimum confidence
         if (sig.confidence < tf.minScore) continue;
 
@@ -761,7 +880,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.4.7-test-push' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.6.0-3confirmations' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -919,6 +1038,59 @@ app.post('/autotrade/connect', express.json(), (req,res) => {
   if (!accountId) return res.status(400).json({error:'Missing'});
   db.prepare('UPDATE autotrade_accounts SET auto_trade=? WHERE account_id=?').run(autoTradeEnabled?1:0,accountId);
   res.json({success:true});
+});
+
+// ── TREND CONSENSUS DEBUG — show MTF trend votes ─────────
+app.get('/trend-consensus', async (req, res) => {
+  try {
+    const timeframes = [
+      { label: '5m',  interval: '5min' },
+      { label: '15m', interval: '15min' },
+      { label: '30m', interval: '30min' },
+      { label: '1H',  interval: '1h' },
+      { label: '4H',  interval: '4h' },
+    ];
+    const trendVotes = { UP: 0, DOWN: 0, NEUTRAL: 0 };
+    const details = {};
+    
+    for (const tf of timeframes) {
+      const candles = await fetchCandles(tf.interval, 220);
+      if (!candles || candles.length < 50) {
+        details[tf.label] = { error: 'not enough candles' };
+        continue;
+      }
+      const closes = candles.map(c => c.close);
+      const ema50 = calcEMA(closes, 50);
+      const ema200 = calcEMA(closes, 200);
+      let trend = 'NEUTRAL';
+      if (ema50 && ema200) {
+        if (ema50 > ema200) trend = 'UP';
+        else if (ema50 < ema200) trend = 'DOWN';
+      }
+      details[tf.label] = { 
+        trend, 
+        price: candles[0].close.toFixed(2),
+        ema50: ema50?.toFixed(2),
+        ema200: ema200?.toFixed(2),
+      };
+      trendVotes[trend]++;
+    }
+    
+    let consensusDirection = null;
+    if (trendVotes.UP >= 3) consensusDirection = 'BUY';
+    else if (trendVotes.DOWN >= 3) consensusDirection = 'SELL';
+    
+    res.json({
+      consensus: consensusDirection || 'NO_CONSENSUS',
+      votes: trendVotes,
+      timeframes: details,
+      message: consensusDirection 
+        ? `Allowed signal direction: ${consensusDirection}` 
+        : 'No signals will be generated until 3+ timeframes agree on direction',
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── DEBUG SCANNER — shows why signals are filtered ─────────
