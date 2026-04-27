@@ -1555,7 +1555,7 @@ async function trackSignalOutcomes() {
     const openSignals = db.prepare("SELECT * FROM signals WHERE outcome = 'open' OR outcome IS NULL").all();
     if (openSignals.length === 0) return;
 
-    const candles = await fetchCandles('5min', 100);
+    const candles = await fetchCandles('5min', 1000); // 5m × 1000 = ~3.5 days lookback
     if (!candles || candles.length < 5) return;
 
     const sortedCandles = [...candles].sort((a, b) => a.timestamp - b.timestamp);
@@ -1574,13 +1574,29 @@ async function trackSignalOutcomes() {
 
         for (const c of relevantCandles) {
           if (isBuy) {
-            if (c.low <= sl) { outcome='sl_hit'; exitPrice=sl; exitTime=c.timestamp; break; }
-            if (c.high >= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
-            if (c.high >= tp1) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
+            const slHit = c.low <= sl;
+            const tp1Hit = c.high >= tp1;
+            const tp2Hit = tp2 && c.high >= tp2;
+            
+            // PESSIMISTIC: If both SL and TP hit in same candle → assume SL came first
+            // This matches realistic trader experience (worst case scenario)
+            if (slHit && (tp1Hit || tp2Hit)) {
+              outcome = 'sl_hit'; exitPrice = sl; exitTime = c.timestamp; break;
+            }
+            if (slHit) { outcome='sl_hit'; exitPrice=sl; exitTime=c.timestamp; break; }
+            if (tp2Hit) { outcome='tp2_hit'; exitPrice=tp2; exitTime=c.timestamp; break; }
+            if (tp1Hit) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
           } else {
-            if (c.high >= sl) { outcome='sl_hit'; exitPrice=sl; exitTime=c.timestamp; break; }
-            if (c.low <= (tp2 || tp1)) { outcome='tp2_hit'; exitPrice=tp2||tp1; exitTime=c.timestamp; break; }
-            if (c.low <= tp1) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
+            const slHit = c.high >= sl;
+            const tp1Hit = c.low <= tp1;
+            const tp2Hit = tp2 && c.low <= tp2;
+            
+            if (slHit && (tp1Hit || tp2Hit)) {
+              outcome = 'sl_hit'; exitPrice = sl; exitTime = c.timestamp; break;
+            }
+            if (slHit) { outcome='sl_hit'; exitPrice=sl; exitTime=c.timestamp; break; }
+            if (tp2Hit) { outcome='tp2_hit'; exitPrice=tp2; exitTime=c.timestamp; break; }
+            if (tp1Hit) { outcome='tp1_hit'; exitPrice=tp1; exitTime=c.timestamp; break; }
           }
         }
 
@@ -1611,7 +1627,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.1.0-confirm-delay' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.1.1-honest-tracker' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
