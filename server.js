@@ -1398,7 +1398,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.0-setup3' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.9.1-state-debug' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -1609,6 +1609,15 @@ app.get('/trend-consensus', async (req, res) => {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── STRATEGY STATE — inspect state machines ──────────────
+app.get('/strategy-state', (req, res) => {
+  res.json({
+    setup2: setup2State,
+    setup3: setup3State,
+    note: 'State per timeframe — null means no active setup pending',
+  });
 });
 
 // ── DEBUG SCANNER — shows why signals are filtered ─────────
