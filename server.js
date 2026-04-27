@@ -766,12 +766,12 @@ async function scanForSignals() {
         if (dev > 0.05) { console.log(`⚠️ [${tf.label}] Stale candles`); continue; }
       }
 
-      // Run all 4 strategies
+      // Only FIB Pullback active — David's primary strategy with 3+ confirmations required
       const fibSignals    = scanFibPullback(candles, tf);
-      const rangeSignals  = scanRangeBounce(candles, tf);
-      const breakoutSigs  = scanBreakout(candles, tf);
-      const emaSignals    = scanEmaPullback(candles, tf);
-      const allSignals    = [...fibSignals, ...rangeSignals, ...breakoutSigs, ...emaSignals];
+      // const rangeSignals  = scanRangeBounce(candles, tf);   // disabled v4.7
+      // const breakoutSigs  = scanBreakout(candles, tf);      // disabled v4.7
+      // const emaSignals    = scanEmaPullback(candles, tf);   // disabled v4.7
+      const allSignals    = [...fibSignals];
 
       for (const sig of allSignals) {
         // ── MTF CONSENSUS FILTER ──
@@ -880,7 +880,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.6.0-3confirmations' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'4.7.0-fib-only' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -888,7 +888,7 @@ app.get('/health', (req,res) => res.json({
   closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
   marketClosed: isMarketClosed(),
   priceCache: cachedPrice,
-  strategies: ['FIB', 'Range Bounce', 'Breakout', 'EMA Pullback'],
+  strategies: ['FIB'],  // Other strategies disabled in v4.7 — FIB-only mode
   timeframes: ['5m', '15m', '30m', '1H', '4H'],
 }));
 
