@@ -16,16 +16,79 @@ if (!admin.apps.length) {
 function sendSignalPush(signal) {
   // Fire-and-forget — never blocks scanner
   if (!admin.apps.length) return;
-  const emoji = signal.action === 'BUY' ? '📈' : '📉';
-  const title = `${emoji} ${signal.action} Signal — XAU/USD`;
-  const body  = `${signal.strategy || 'FIB'} · Entry: $${signal.price} · ${signal.confidence || 0}% Confidence`;
-  admin.messaging().send({
+  
+  const emoji = signal.action === 'BUY' ? '🟢' : '🔴';
+  const direction = signal.action === 'BUY' ? '▲' : '▼';
+  
+  // Title: Direction + Action + Symbol + Price
+  const title = `${emoji} ${direction} ${signal.action} XAU/USD @ $${Number(signal.price).toFixed(2)}`;
+  
+  // Body: Strategy + Confidence + TP/SL info  
+  const parts = [];
+  if (signal.strategy) {
+    // Shorten strategy names for push
+    const shortStrategy = signal.strategy
+      .replace('Setup 2 Breakout+Retest', 'Breakout+Retest')
+      .replace('Setup 3 Double Top', 'Double Top')
+      .replace('Setup 3 Double Bottom', 'Double Bottom')
+      .replace('FIB', 'FIB Pullback');
+    parts.push(shortStrategy);
+  }
+  if (signal.fib_level) parts.push(signal.fib_level);
+  if (signal.confidence) parts.push(`${signal.confidence}% conf`);
+  if (signal.tp1) parts.push(`TP $${Number(signal.tp1).toFixed(2)}`);
+  
+  const body = parts.join(' · ');
+  
+  // Sub-title for iOS (shows on lockscreen)
+  const subtitle = signal.pattern && signal.pattern !== 'No pattern' 
+    ? signal.pattern.replace(' (Liquidity Sweep Confirmed)', ' ✓')
+    : null;
+  
+  const payload = {
     topic: 'signals',
     notification: { title, body },
-    data: { action: signal.action, price: String(signal.price), confidence: String(signal.confidence || 0) },
-    apns: { payload: { aps: { sound: 'default', badge: 1 } }, headers: { 'apns-priority': '10' } },
-    android: { priority: 'high', notification: { title, body, channelId: 'pulstrade_signals', priority: 'max' } },
-  }).then(() => console.log(`✓ Push: ${title}`)).catch(e => console.error('Push error:', e.message));
+    data: { 
+      signal_id: String(signal.id || ''),
+      action: signal.action || '',
+      price: String(signal.price || ''),
+      sl: String(signal.sl || ''),
+      tp1: String(signal.tp1 || ''),
+      tp2: String(signal.tp2 || ''),
+      strategy: signal.strategy || '',
+      confidence: String(signal.confidence || 0),
+      timeframe: signal.timeframe || '',
+      fib_level: signal.fib_level || '',
+      pattern: signal.pattern || '',
+    },
+    apns: { 
+      payload: { 
+        aps: { 
+          sound: 'default', 
+          badge: 1,
+          'mutable-content': 1,
+          alert: subtitle ? { title, subtitle, body } : { title, body },
+        } 
+      }, 
+      headers: { 'apns-priority': '10' } 
+    },
+    android: { 
+      priority: 'high', 
+      notification: { 
+        title, 
+        body, 
+        channelId: 'pulstrade_signals', 
+        priority: 'max',
+        defaultSound: true,
+        defaultVibrateTimings: true,
+        color: signal.action === 'BUY' ? '#10B981' : '#EF4444',
+      } 
+    },
+  };
+  
+  admin.messaging().send(payload)
+    .then(() => console.log(`✓ Push sent: ${title}`))
+    .catch(e => console.error('Push error:', e.message));
 }
 
 const app  = express();
@@ -39,7 +102,12 @@ const TICKER = 'XAU/USD';
 app.use(cors());
 app.use(express.json());
 
-const db = new Database(process.env.DB_PATH || '/tmp/pulstrade.db');
+// DB Path: use /data (persistent volume) if available, else /tmp (ephemeral)
+const fs = require('fs');
+const DB_DIR = fs.existsSync('/data') ? '/data' : '/tmp';
+const DB_PATH = process.env.DB_PATH || `${DB_DIR}/pulstrade.db`;
+console.log(`📂 Database path: ${DB_PATH} (${DB_DIR === '/data' ? 'PERSISTENT' : 'EPHEMERAL'})`);
+const db = new Database(DB_PATH);
 db.exec(`
   CREATE TABLE IF NOT EXISTS signals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1627,7 +1695,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.1.1-honest-tracker' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.2.1-rich-push' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -2018,6 +2086,66 @@ app.get('/force-scan', async (req, res) => {
   await scanForSignals();
   const after = db.prepare('SELECT COUNT(*) as c FROM signals').get().c;
   res.json({ triggered: true, signalsBefore: before, signalsAfter: after, newSignals: after - before });
+});
+
+// ── Market Overview Cache (DXY, Oil, BTC, SPX) ────────────────
+const marketOverviewCache = { data: null, timestamp: 0 };
+const MARKET_CACHE_TTL = 60 * 1000; // 60s cache
+
+async function fetchMarketOverview() {
+  // Returns {dxy, oil, btc, spx} with price + change%
+  // Uses Twelve Data — handles symbol correctly
+  const symbols = {
+    dxy: 'DXY',       // US Dollar Index
+    oil: 'WTI/USD',   // Oil WTI Crude  
+    btc: 'BTC/USD',   // Bitcoin
+    spx: 'SPX',       // S&P 500
+  };
+  
+  const result = {};
+  
+  // Fetch all symbols in parallel — but use time_series for change %
+  await Promise.all(Object.entries(symbols).map(async ([key, symbol]) => {
+    try {
+      const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=2&apikey=${TWELVE_API_KEY}`;
+      const r = await axios.get(url, { timeout: 8000 });
+      const values = r.data?.values;
+      if (values && values.length >= 2) {
+        const today = parseFloat(values[0].close);
+        const prev = parseFloat(values[1].close);
+        const change = prev !== 0 ? ((today - prev) / prev) * 100 : 0;
+        result[key] = { price: today, change };
+      } else {
+        result[key] = null;
+      }
+    } catch(e) {
+      console.log(`⚠️ Market overview ${key} (${symbol}) failed: ${e.message}`);
+      result[key] = null;
+    }
+  }));
+  
+  return result;
+}
+
+app.get('/market-overview', async (req, res) => {
+  // Use cached version if recent
+  const now = Date.now();
+  if (marketOverviewCache.data && (now - marketOverviewCache.timestamp) < MARKET_CACHE_TTL) {
+    return res.json({ ...marketOverviewCache.data, cached: true, age: Math.floor((now - marketOverviewCache.timestamp) / 1000) });
+  }
+  
+  try {
+    const data = await fetchMarketOverview();
+    marketOverviewCache.data = data;
+    marketOverviewCache.timestamp = now;
+    res.json({ ...data, cached: false });
+  } catch(e) {
+    // If cache exists, return stale data on error
+    if (marketOverviewCache.data) {
+      return res.json({ ...marketOverviewCache.data, cached: true, stale: true });
+    }
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/calendar', async (req, res) => {
