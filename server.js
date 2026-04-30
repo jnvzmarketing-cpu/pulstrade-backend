@@ -1751,9 +1751,21 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.3.1-smart-mtf' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.3.2-diag' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
+  version: '5.3.2-diag',
+  dbPath: DB_PATH,
+  dbPersistent: dbInfo.persistent,
+  dbDir: DB_DIR,
+  // List all candidate paths and whether they exist
+  pathChecks: {
+    '/data': fs.existsSync('/data'),
+    '/var/lib/data': fs.existsSync('/var/lib/data'),
+    '/storage': fs.existsSync('/storage'),
+    '/mnt/data': fs.existsSync('/mnt/data'),
+    '/tmp': fs.existsSync('/tmp'),
+  },
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
   open:    db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome='open' OR outcome IS NULL").get().c,
   closed:  db.prepare("SELECT COUNT(*) as c FROM signals WHERE outcome IS NOT NULL AND outcome != 'open'").get().c,
