@@ -102,11 +102,34 @@ const TICKER = 'XAU/USD';
 app.use(cors());
 app.use(express.json());
 
-// DB Path: use /data (persistent volume) if available, else /tmp (ephemeral)
+// DB Path: prefer persistent volume, fallback to /tmp (ephemeral)
 const fs = require('fs');
-const DB_DIR = fs.existsSync('/data') ? '/data' : '/tmp';
+
+function detectDbDir() {
+  // Check common Railway volume mount paths
+  const candidates = ['/data', '/var/lib/data', '/storage', '/mnt/data'];
+  for (const path of candidates) {
+    try {
+      if (fs.existsSync(path)) {
+        // Try to write — make sure it's writable
+        const testFile = `${path}/.pulstrade_writetest`;
+        fs.writeFileSync(testFile, 'test');
+        fs.unlinkSync(testFile);
+        return { dir: path, persistent: true };
+      }
+    } catch (e) { /* not writable */ }
+  }
+  return { dir: '/tmp', persistent: false };
+}
+
+const dbInfo = detectDbDir();
+const DB_DIR = dbInfo.dir;
 const DB_PATH = process.env.DB_PATH || `${DB_DIR}/pulstrade.db`;
-console.log(`📂 Database path: ${DB_PATH} (${DB_DIR === '/data' ? 'PERSISTENT' : 'EPHEMERAL'})`);
+console.log(`📂 Database path: ${DB_PATH} (${dbInfo.persistent ? 'PERSISTENT ✓' : 'EPHEMERAL ⚠️'})`);
+if (!dbInfo.persistent) {
+  console.log(`⚠️ WARNING: DB is on /tmp — data will be lost on next deploy!`);
+  console.log(`   Set Railway Volume Mount Path to /data to enable persistence.`);
+}
 const db = new Database(DB_PATH);
 db.exec(`
   CREATE TABLE IF NOT EXISTS signals (
@@ -1590,16 +1613,20 @@ async function scanForSignals() {
       for (const sig of allSignals) {
         console.log(`  → Checking ${sig.action} ${sig.strategy} conf=${sig.confidence} fib=${sig.fib_level || 'n/a'}`);
         
-        // ── MTF CONSENSUS FILTER (only for FIB Pullback strategy) ──
-        // FIB is a TREND-FOLLOWING strategy → must align with MTF consensus
-        // Setup 2 (Breakout) + Setup 3 (Reversal) → can go AGAINST trend
+        // ── SMART MTF FILTER ──
+        // FIB is trend-following BUT 5m/15m are SHORT-TERM pullbacks
+        // → Allow pullback signals (SELL on 5m during UP trend = catching the dip)
+        // → Block on 30m/1H/4H where signal direction must match higher trend
         const isTrendFollowing = sig.strategy === 'FIB';
-        if (isTrendFollowing && sig.action !== consensusDirection) {
-          console.log(`  🚫 BLOCKED: FIB against MTF consensus (need ${consensusDirection})`);
+        const isShortTermTF = (tf.label === '5m' || tf.label === '15m');
+        const shouldFilterMTF = isTrendFollowing && !isShortTermTF;
+        
+        if (shouldFilterMTF && sig.action !== consensusDirection) {
+          console.log(`  🚫 BLOCKED: ${sig.strategy} ${tf.label} against MTF consensus (need ${consensusDirection})`);
           continue;
         }
-        if (!isTrendFollowing) {
-          console.log(`  ✓ MTF check skipped: ${sig.strategy} is not trend-following`);
+        if (!shouldFilterMTF) {
+          console.log(`  ✓ MTF check skipped: ${sig.strategy} on ${tf.label} (short-term pullback allowed)`);
         }
         
         // Filter by minimum confidence
@@ -1724,7 +1751,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.3.0-modern-trend' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.3.1-smart-mtf' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
