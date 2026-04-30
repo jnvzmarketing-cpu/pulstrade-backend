@@ -1573,11 +1573,10 @@ async function scanForSignals() {
   else if (trendVotes.DOWN >= CONSENSUS_THRESHOLD) consensusDirection = 'SELL';
   
   if (!consensusDirection) {
-    console.log(`⚠️ No clear MTF consensus — skipping all signals (need ${CONSENSUS_THRESHOLD}/5 agreement)`);
-    return;
+    console.log(`⚠️ No clear MTF consensus — FIB on 30m/1H/4H will be blocked, but Setup 2/3 + 5m/15m FIB still run`);
+  } else {
+    console.log(`✅ MTF Consensus: ${consensusDirection} (${consensusDirection === 'BUY' ? trendVotes.UP : trendVotes.DOWN}/5 timeframes)`);
   }
-  
-  console.log(`✅ MTF Consensus: ${consensusDirection} (${consensusDirection === 'BUY' ? trendVotes.UP : trendVotes.DOWN}/5 timeframes)`);
 
   for (const tf of timeframes) {
     try {
@@ -1617,16 +1616,22 @@ async function scanForSignals() {
         // FIB is trend-following BUT 5m/15m are SHORT-TERM pullbacks
         // → Allow pullback signals (SELL on 5m during UP trend = catching the dip)
         // → Block on 30m/1H/4H where signal direction must match higher trend
+        // → If NO consensus (mixed market), block FIB on higher TFs entirely
         const isTrendFollowing = sig.strategy === 'FIB';
         const isShortTermTF = (tf.label === '5m' || tf.label === '15m');
         const shouldFilterMTF = isTrendFollowing && !isShortTermTF;
         
-        if (shouldFilterMTF && sig.action !== consensusDirection) {
-          console.log(`  🚫 BLOCKED: ${sig.strategy} ${tf.label} against MTF consensus (need ${consensusDirection})`);
-          continue;
-        }
-        if (!shouldFilterMTF) {
-          console.log(`  ✓ MTF check skipped: ${sig.strategy} on ${tf.label} (short-term pullback allowed)`);
+        if (shouldFilterMTF) {
+          if (!consensusDirection) {
+            console.log(`  🚫 BLOCKED: FIB ${tf.label} — no MTF consensus, market mixed`);
+            continue;
+          }
+          if (sig.action !== consensusDirection) {
+            console.log(`  🚫 BLOCKED: ${sig.strategy} ${tf.label} against MTF consensus (need ${consensusDirection})`);
+            continue;
+          }
+        } else {
+          console.log(`  ✓ MTF check skipped: ${sig.strategy} on ${tf.label} (short-term/reversal allowed)`);
         }
         
         // Filter by minimum confidence
@@ -1751,10 +1756,10 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.3.2-diag' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.4.0-no-skip-on-mixed' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
-  version: '5.3.2-diag',
+  version: '5.4.0-no-skip-on-mixed',
   dbPath: DB_PATH,
   dbPersistent: dbInfo.persistent,
   dbDir: DB_DIR,
