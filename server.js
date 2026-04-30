@@ -1508,10 +1508,33 @@ async function scanForSignals() {
       const tfEma50 = calcEMA(tfCloses, 50);
       const tfEma200 = calcEMA(tfCloses, 200);
       
+      // ── MODERN TREND DETECTION ───────────────────────────────────────
+      // Combines: short-term slope (last 20 candles) + EMA50 vs current price
+      // This reacts to RECENT moves, not just long-term trends
+      // candles are NEWEST-FIRST: index 0 = most recent
       let trend = 'NEUTRAL';
-      if (tfEma50 && tfEma200) {
-        if (tfEma50 > tfEma200) trend = 'UP';
-        else if (tfEma50 < tfEma200) trend = 'DOWN';
+      if (tfCandles.length >= 20 && tfEma50) {
+        // 1) Short-term slope (last 20 candles) — primary signal
+        const recent20Closes = tfCandles.slice(0, 20).map(c => c.close);
+        const slopeStart = recent20Closes[recent20Closes.length - 1]; // 20 candles ago
+        const slopeEnd = recent20Closes[0]; // most recent
+        const slope = (slopeEnd - slopeStart) / slopeStart;
+        
+        // 2) Current price vs EMA50 — trend confirmation
+        const currentPrice = tfCloses[tfCloses.length - 1];
+        const aboveEma50 = currentPrice > tfEma50;
+        const belowEma50 = currentPrice < tfEma50;
+        
+        // Threshold: 0.05% over 20 candles = real movement (not noise)
+        const SLOPE_THRESHOLD = 0.0005;
+        
+        // Trend is UP if: slope is up AND price above EMA50
+        if (slope > SLOPE_THRESHOLD && aboveEma50) {
+          trend = 'UP';
+        } else if (slope < -SLOPE_THRESHOLD && belowEma50) {
+          trend = 'DOWN';
+        }
+        // If slope and EMA disagree → NEUTRAL (no clear direction)
       }
       tfTrends[tf.label] = trend;
       trendVotes[trend]++;
@@ -1567,10 +1590,16 @@ async function scanForSignals() {
       for (const sig of allSignals) {
         console.log(`  → Checking ${sig.action} ${sig.strategy} conf=${sig.confidence} fib=${sig.fib_level || 'n/a'}`);
         
-        // ── MTF CONSENSUS FILTER ──
-        if (sig.action !== consensusDirection) {
-          console.log(`  🚫 BLOCKED: against MTF consensus (need ${consensusDirection})`);
+        // ── MTF CONSENSUS FILTER (only for FIB Pullback strategy) ──
+        // FIB is a TREND-FOLLOWING strategy → must align with MTF consensus
+        // Setup 2 (Breakout) + Setup 3 (Reversal) → can go AGAINST trend
+        const isTrendFollowing = sig.strategy === 'FIB';
+        if (isTrendFollowing && sig.action !== consensusDirection) {
+          console.log(`  🚫 BLOCKED: FIB against MTF consensus (need ${consensusDirection})`);
           continue;
+        }
+        if (!isTrendFollowing) {
+          console.log(`  ✓ MTF check skipped: ${sig.strategy} is not trend-following`);
         }
         
         // Filter by minimum confidence
@@ -1695,7 +1724,7 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.2.1-rich-push' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.3.0-modern-trend' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
   signals: db.prepare('SELECT COUNT(*) as c FROM signals').get().c,
@@ -1877,14 +1906,26 @@ app.get('/trend-consensus', async (req, res) => {
       const closes = candles.map(c => c.close);
       const ema50 = calcEMA(closes, 50);
       const ema200 = calcEMA(closes, 200);
+      
+      // Use SAME modern trend detection as scanner
       let trend = 'NEUTRAL';
-      if (ema50 && ema200) {
-        if (ema50 > ema200) trend = 'UP';
-        else if (ema50 < ema200) trend = 'DOWN';
+      let slope = 0;
+      if (candles.length >= 20 && ema50) {
+        const recent20 = candles.slice(0, 20).map(c => c.close);
+        const slopeStart = recent20[recent20.length - 1];
+        const slopeEnd = recent20[0];
+        slope = (slopeEnd - slopeStart) / slopeStart;
+        const currentPrice = closes[closes.length - 1];
+        const aboveEma50 = currentPrice > ema50;
+        const belowEma50 = currentPrice < ema50;
+        const SLOPE_THRESHOLD = 0.0005;
+        if (slope > SLOPE_THRESHOLD && aboveEma50) trend = 'UP';
+        else if (slope < -SLOPE_THRESHOLD && belowEma50) trend = 'DOWN';
       }
       details[tf.label] = { 
         trend, 
         price: candles[0].close.toFixed(2),
+        slope_pct: (slope * 100).toFixed(3),
         ema50: ema50?.toFixed(2),
         ema200: ema200?.toFixed(2),
       };
