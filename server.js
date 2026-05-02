@@ -91,6 +91,149 @@ function sendSignalPush(signal) {
     .catch(e => console.error('Push error:', e.message));
 }
 
+// ════════════════════════════════════════════════════════════════════
+// TELEGRAM SIGNAL BROADCASTER (A+ SETUPS ONLY)
+// ════════════════════════════════════════════════════════════════════
+// Strategy: Only broadcast HIGH-CONFIDENCE A+ setups (75%+ confidence)
+// to Telegram free tier. App users get all signals (mid + low confidence).
+// This drives Telegram → App upgrades while keeping Telegram premium-feel.
+// ════════════════════════════════════════════════════════════════════
+
+const TELEGRAM_BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN  || '';
+const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || '';
+const TELEGRAM_MIN_CONFIDENCE = parseInt(process.env.TELEGRAM_MIN_CONFIDENCE || '75', 10);
+const APP_STORE_URL = 'https://apps.apple.com/de/app/pulstrade/id6762018999';
+
+async function sendTelegramSignal(signal, retryCount = 0) {
+  // Guard: skip if Telegram not configured
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) {
+    return; // silent skip — backend works fine without Telegram
+  }
+
+  // A+ FILTER: only broadcast high-confidence setups
+  if ((signal.confidence || 0) < TELEGRAM_MIN_CONFIDENCE) {
+    console.log(`📵 Telegram skipped: ${signal.action} ${signal.timeframe} confidence ${signal.confidence}% < ${TELEGRAM_MIN_CONFIDENCE}% (App-only signal)`);
+    return;
+  }
+
+  try {
+    const directionEmoji = signal.action === 'BUY' ? '🟢' : '🔴';
+    const arrow          = signal.action === 'BUY' ? '▲' : '▼';
+    const setupGrade     = signal.confidence >= 78 ? 'A+' : 'A';
+
+    // Calculate R:R for display
+    const entry = Number(signal.price);
+    const sl    = Number(signal.sl);
+    const tp1   = Number(signal.tp1);
+    const tp2   = Number(signal.tp2);
+    const risk  = Math.abs(entry - sl);
+    const rr1   = risk > 0 ? (Math.abs(tp1 - entry) / risk).toFixed(2) : '—';
+    const rr2   = risk > 0 ? (Math.abs(tp2 - entry) / risk).toFixed(2) : '—';
+
+    // Strategy short name
+    const strategyShort = (signal.strategy || '')
+      .replace('Setup 2 Breakout+Retest', 'Breakout+Retest')
+      .replace('Setup 3 Double Top', 'Double Top')
+      .replace('Setup 3 Double Bottom', 'Double Bottom')
+      .replace('FIB', 'FIB Pullback');
+
+    // Build HTML message
+    const lines = [
+      `<b>🥇 ${setupGrade} SETUP · ${signal.confidence}% CONFIDENCE</b>`,
+      ``,
+      `<b>${directionEmoji} ${arrow} ${signal.action} XAU/USD</b>`,
+      `<i>${strategyShort}${signal.fib_level ? ' · FIB ' + signal.fib_level : ''} · ${signal.timeframe}</i>`,
+      ``,
+      `📍 <b>Entry:</b>     <code>$${entry.toFixed(2)}</code>`,
+      `🛡️ <b>Stop Loss:</b> <code>$${sl.toFixed(2)}</code>`,
+      `🎯 <b>Take Profit 1:</b> <code>$${tp1.toFixed(2)}</code>  <i>(${rr1}R)</i>`,
+      `🎯 <b>Take Profit 2:</b> <code>$${tp2.toFixed(2)}</code>  <i>(${rr2}R)</i>`,
+    ];
+
+    if (signal.pattern && signal.pattern !== 'No pattern') {
+      lines.push(``);
+      lines.push(`📊 <b>Pattern:</b> ${signal.pattern}`);
+    }
+    if (signal.rsi) {
+      lines.push(`📈 <b>RSI:</b> ${Number(signal.rsi).toFixed(1)}`);
+    }
+
+    lines.push(``);
+    lines.push(`⚡ <i>Want push notifications + auto-trading?</i>`);
+    lines.push(`<a href="${APP_STORE_URL}">📱 Get Pulstrade App — 7-day free trial</a>`);
+
+    const message = lines.join('\n');
+
+    const response = await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_CHANNEL_ID,
+        text: message,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      },
+      { timeout: 10000 }
+    );
+
+    const messageId = response.data?.result?.message_id;
+    console.log(`✅ Telegram posted: ${signal.action} ${signal.timeframe} ${signal.confidence}% (msg #${messageId})`);
+
+    // Save Telegram message_id to DB so we can edit later when TP/SL hit
+    if (messageId && signal.id) {
+      try {
+        db.prepare('UPDATE signals SET telegram_msg_id = ? WHERE id = ?').run(messageId, signal.id);
+      } catch (e) {
+        // Column may not exist yet — silently skip
+      }
+    }
+
+    return { success: true, messageId };
+
+  } catch (error) {
+    const status = error.response?.status;
+    const errMsg = error.response?.data?.description || error.message;
+    console.error(`❌ Telegram error [${status}]:`, errMsg);
+
+    // Retry on network/5xx errors only (not 400 bad request)
+    if (retryCount < 2 && (!status || status >= 500)) {
+      await new Promise(r => setTimeout(r, 2000 * (retryCount + 1)));
+      return sendTelegramSignal(signal, retryCount + 1);
+    }
+    return { success: false, error: errMsg };
+  }
+}
+
+// Edit Telegram message when outcome hits (TP or SL)
+async function updateTelegramOutcome(signal, outcome) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) return;
+  if (!signal.telegram_msg_id) return;
+
+  try {
+    const emoji = outcome === 'tp1_hit' || outcome === 'tp2_hit' ? '✅' : '❌';
+    const label = outcome === 'tp1_hit' ? 'TP1 HIT' :
+                  outcome === 'tp2_hit' ? 'TP2 HIT' :
+                  outcome === 'sl_hit'  ? 'SL HIT'  : 'CLOSED';
+    const pnl = signal.pnl_r ? `${signal.pnl_r > 0 ? '+' : ''}${signal.pnl_r}R` : '';
+
+    const reply = `${emoji} <b>${label}</b> · ${pnl}\nClosed at <code>$${Number(signal.exit_price).toFixed(2)}</code>`;
+
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_CHANNEL_ID,
+        text: reply,
+        parse_mode: 'HTML',
+        reply_to_message_id: signal.telegram_msg_id,
+        disable_notification: false,
+      },
+      { timeout: 10000 }
+    );
+    console.log(`✅ Telegram outcome posted for signal #${signal.id}: ${label}`);
+  } catch (e) {
+    console.error('Telegram outcome error:', e.response?.data?.description || e.message);
+  }
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 const TWELVE_API_KEY = process.env.TWELVE_DATA_API_KEY || '';
@@ -175,6 +318,7 @@ try {
   if (!cols.includes('closed_at'))  db.exec("ALTER TABLE signals ADD COLUMN closed_at INTEGER");
   if (!cols.includes('pnl_r'))      db.exec("ALTER TABLE signals ADD COLUMN pnl_r REAL");
   if (!cols.includes('strategy'))   db.exec("ALTER TABLE signals ADD COLUMN strategy TEXT DEFAULT 'FIB'");
+  if (!cols.includes('telegram_msg_id')) db.exec("ALTER TABLE signals ADD COLUMN telegram_msg_id INTEGER");
   console.log('✓ Migrations OK');
 } catch(e) { console.error('Migration error:', e.message); }
 
@@ -1667,6 +1811,7 @@ async function scanForSignals() {
           console.log(`✓ INSERTED [${sig.strategy}] ${sig.action} ${TICKER} @ ${sig.price} (${tf.label}, ${sig.confidence}%)`);
           const inserted = db.prepare('SELECT last_insert_rowid() as id').get();
           try { sendSignalPush({ ...record, id: inserted.id }); } catch(pushErr) { console.error('Push call error:', pushErr.message); }
+          try { sendTelegramSignal({ ...record, id: inserted.id }); } catch(tgErr) { console.error('Telegram call error:', tgErr.message); }
         } catch(dbErr) {
           console.error(`❌ DB INSERT FAILED [${tf.label}] ${sig.action} ${sig.strategy}:`, dbErr.message);
           console.error('Record was:', JSON.stringify(record));
@@ -1743,9 +1888,14 @@ async function trackSignalOutcomes() {
           const risk = Math.abs(signal.price - sl);
           const profit = isBuy ? (exitPrice - signal.price) : (signal.price - exitPrice);
           const pnlR = risk > 0 ? profit / risk : 0;
+          const finalPnlR = Math.round(pnlR * 100) / 100;
           db.prepare(`UPDATE signals SET outcome=?, exit_price=?, closed_at=?, pnl_r=? WHERE id=?`)
-            .run(outcome, exitPrice, exitTime, Math.round(pnlR * 100) / 100, signal.id);
+            .run(outcome, exitPrice, exitTime, finalPnlR, signal.id);
           closedCount++;
+          // Post outcome reply to Telegram (if signal was broadcast there)
+          try {
+            updateTelegramOutcome({ ...signal, exit_price: exitPrice, pnl_r: finalPnlR }, outcome);
+          } catch(tgErr) { /* silent */ }
         }
       } catch(e) {}
     }
@@ -1756,10 +1906,10 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.4.0-no-skip-on-mixed' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.5.0-telegram' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
-  version: '5.4.0-no-skip-on-mixed',
+  version: '5.5.0-telegram',
   dbPath: DB_PATH,
   dbPersistent: dbInfo.persistent,
   dbDir: DB_DIR,
@@ -2124,6 +2274,36 @@ app.get('/test-push', async (req, res) => {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── TEST TELEGRAM — verify bot + channel work ──────────────
+app.get('/test-telegram', async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) {
+    return res.status(500).json({
+      error: 'Telegram not configured',
+      missing: {
+        TELEGRAM_BOT_TOKEN: !TELEGRAM_BOT_TOKEN,
+        TELEGRAM_CHANNEL_ID: !TELEGRAM_CHANNEL_ID,
+      }
+    });
+  }
+  // Build mock A+ signal for testing
+  const testSignal = {
+    id: 9999,
+    action: 'BUY',
+    price: 4615.57,
+    sl: 4610.61,
+    tp1: 4625.50,
+    tp2: 4632.12,
+    timeframe: '5m',
+    confidence: 80,
+    fib_level: '61.8%',
+    pattern: 'Bullish Engulfing',
+    strategy: 'FIB',
+    rsi: 37.8,
+  };
+  const result = await sendTelegramSignal(testSignal);
+  res.json({ success: result?.success !== false, ...result, sentAs: testSignal });
 });
 
 // ── FORCE SCAN — manually trigger scanner ──────────────────
