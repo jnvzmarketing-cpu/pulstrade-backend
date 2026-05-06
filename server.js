@@ -259,29 +259,8 @@ const TRUMP_ENABLED        = process.env.TRUMP_MONITOR_ENABLED !== 'false'; // d
 // In-memory cache of seen post IDs (persists in DB too)
 const seenTrumpPosts = new Set();
 
-// ── DB schema for trump_events ──────────────────────────────
-db.exec(`CREATE TABLE IF NOT EXISTS trump_events (
-  id            TEXT PRIMARY KEY,
-  platform      TEXT NOT NULL,
-  text          TEXT NOT NULL,
-  url           TEXT,
-  posted_at     INTEGER NOT NULL,
-  detected_at   INTEGER NOT NULL,
-  impact        TEXT,
-  direction     TEXT,
-  confidence    REAL,
-  reason        TEXT,
-  expected_move REAL,
-  notified      INTEGER DEFAULT 0
-)`);
-
-// Load seen posts on boot (last 7 days)
-try {
-  const recent = db.prepare(`SELECT id FROM trump_events WHERE detected_at > ?`)
-    .all(Date.now() - 7*24*3600000);
-  recent.forEach(r => seenTrumpPosts.add(r.id));
-  console.log(`📋 Loaded ${seenTrumpPosts.size} seen Trump posts from DB`);
-} catch(e) { console.error('Trump DB load:', e.message); }
+// DB schema + seen posts loading happens AFTER db is initialized (further down in file)
+// See: initTrumpDb() function called near app.listen()
 
 // ── 1. Truth Social Polling (RSS) ───────────────────────────
 async function pollTruthSocial() {
@@ -605,14 +584,40 @@ async function pollTrumpAndAnalyze() {
   }
 }
 
+// Trump DB initialization — called AFTER db is defined (see below where db init happens)
+function initTrumpDb() {
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS trump_events (
+      id            TEXT PRIMARY KEY,
+      platform      TEXT NOT NULL,
+      text          TEXT NOT NULL,
+      url           TEXT,
+      posted_at     INTEGER NOT NULL,
+      detected_at   INTEGER NOT NULL,
+      impact        TEXT,
+      direction     TEXT,
+      confidence    REAL,
+      reason        TEXT,
+      expected_move REAL,
+      notified      INTEGER DEFAULT 0
+    )`);
+    const recent = db.prepare(`SELECT id FROM trump_events WHERE detected_at > ?`)
+      .all(Date.now() - 7*24*3600000);
+    recent.forEach(r => seenTrumpPosts.add(r.id));
+    console.log(`📋 Trump DB ready · ${seenTrumpPosts.size} seen posts loaded`);
+  } catch(e) {
+    console.error('Trump DB init error:', e.message);
+  }
+}
+
 // Boot trump monitor
 if (TRUMP_ENABLED) {
   console.log(`🐘 Trump Monitor: ENABLED (poll every ${TRUMP_POLL_INTERVAL/1000}s)`);
   console.log(`   - Truth Social: @${TRUTHSOCIAL_USER}`);
   console.log(`   - Twitter/X:    @${TWITTER_USERNAME}`);
   console.log(`   - AI Analysis:  ${ANTHROPIC_API_KEY ? 'Claude API ✓' : 'Keyword fallback'}`);
-  // First poll after 30s to let DB settle
-  setTimeout(pollTrumpAndAnalyze, 30000);
+  // First poll after 30s to let DB settle (DB init happens further down)
+  setTimeout(() => { initTrumpDb(); pollTrumpAndAnalyze(); }, 30000);
   setInterval(pollTrumpAndAnalyze, TRUMP_POLL_INTERVAL);
 } else {
   console.log(`🐘 Trump Monitor: DISABLED (set TRUMP_MONITOR_ENABLED=true to enable)`);
