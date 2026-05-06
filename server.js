@@ -242,6 +242,382 @@ const METAAPI_TOKEN  = process.env.METAAPI_TOKEN || '';
 const METAAPI_URL    = 'https://mt-client-api-v1.london.agiliumtrade.ai';
 const TICKER = 'XAU/USD';
 
+// ════════════════════════════════════════════════════════════════════
+// TRUMP X / TRUTH SOCIAL MONITOR (with AI Sentiment Analysis)
+// ════════════════════════════════════════════════════════════════════
+// Monitors Trump's posts on Truth Social + X/Twitter
+// Uses Claude AI to analyze gold-market impact (BULLISH/BEARISH/NEUTRAL)
+// Posts alerts to Telegram + sends Push to App users
+// ════════════════════════════════════════════════════════════════════
+
+const ANTHROPIC_API_KEY    = process.env.ANTHROPIC_API_KEY || '';
+const TRUTHSOCIAL_USER     = 'realDonaldTrump';
+const TWITTER_USERNAME     = 'realDonaldTrump';
+const TRUMP_POLL_INTERVAL  = 60 * 1000; // 60 seconds
+const TRUMP_ENABLED        = process.env.TRUMP_MONITOR_ENABLED !== 'false'; // default ON
+
+// In-memory cache of seen post IDs (persists in DB too)
+const seenTrumpPosts = new Set();
+
+// ── DB schema for trump_events ──────────────────────────────
+db.exec(`CREATE TABLE IF NOT EXISTS trump_events (
+  id            TEXT PRIMARY KEY,
+  platform      TEXT NOT NULL,
+  text          TEXT NOT NULL,
+  url           TEXT,
+  posted_at     INTEGER NOT NULL,
+  detected_at   INTEGER NOT NULL,
+  impact        TEXT,
+  direction     TEXT,
+  confidence    REAL,
+  reason        TEXT,
+  expected_move REAL,
+  notified      INTEGER DEFAULT 0
+)`);
+
+// Load seen posts on boot (last 7 days)
+try {
+  const recent = db.prepare(`SELECT id FROM trump_events WHERE detected_at > ?`)
+    .all(Date.now() - 7*24*3600000);
+  recent.forEach(r => seenTrumpPosts.add(r.id));
+  console.log(`📋 Loaded ${seenTrumpPosts.size} seen Trump posts from DB`);
+} catch(e) { console.error('Trump DB load:', e.message); }
+
+// ── 1. Truth Social Polling (RSS) ───────────────────────────
+async function pollTruthSocial() {
+  try {
+    // Truth Social public RSS endpoint
+    const url = `https://truthsocial.com/users/${TRUTHSOCIAL_USER}/statuses.rss`;
+    const r = await axios.get(url, {
+      timeout: 8000,
+      headers: { 'User-Agent': 'Mozilla/5.0 PulstradeBot/1.0' }
+    });
+    if (!r.data) return [];
+
+    // Quick & dirty XML parsing without external lib
+    const items = [];
+    const itemBlocks = r.data.split(/<item>/).slice(1);
+    for (const block of itemBlocks) {
+      const closeIdx = block.indexOf('</item>');
+      if (closeIdx === -1) continue;
+      const item = block.substring(0, closeIdx);
+
+      const titleMatch = item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/s) ||
+                         item.match(/<title>(.*?)<\/title>/s);
+      const linkMatch  = item.match(/<link>(.*?)<\/link>/s);
+      const dateMatch  = item.match(/<pubDate>(.*?)<\/pubDate>/s);
+      const guidMatch  = item.match(/<guid[^>]*>(.*?)<\/guid>/s);
+      const descMatch  = item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/s) ||
+                         item.match(/<description>(.*?)<\/description>/s);
+
+      const text = (titleMatch?.[1] || descMatch?.[1] || '')
+        .replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+      if (!text) continue;
+
+      items.push({
+        id: 'ts_' + (guidMatch?.[1] || linkMatch?.[1] || '').split('/').pop(),
+        platform: 'truth_social',
+        text: text.substring(0, 500),
+        url: linkMatch?.[1] || '',
+        posted_at: dateMatch?.[1] ? new Date(dateMatch[1]).getTime() : Date.now(),
+      });
+    }
+    return items;
+  } catch(e) {
+    if (e.response?.status !== 404) {
+      console.error('TruthSocial poll error:', e.message);
+    }
+    return [];
+  }
+}
+
+// ── 2. Twitter/X Polling (via Nitter mirror) ────────────────
+async function pollTwitter() {
+  try {
+    // Nitter is a free Twitter scraper. Use multiple instances for reliability.
+    const instances = [
+      'https://nitter.net',
+      'https://nitter.privacydev.net',
+      'https://nitter.poast.org',
+    ];
+
+    for (const base of instances) {
+      try {
+        const url = `${base}/${TWITTER_USERNAME}/rss`;
+        const r = await axios.get(url, {
+          timeout: 6000,
+          headers: { 'User-Agent': 'Mozilla/5.0 PulstradeBot/1.0' }
+        });
+        if (!r.data) continue;
+
+        const items = [];
+        const itemBlocks = r.data.split(/<item>/).slice(1);
+        for (const block of itemBlocks) {
+          const closeIdx = block.indexOf('</item>');
+          if (closeIdx === -1) continue;
+          const item = block.substring(0, closeIdx);
+
+          const titleMatch = item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/s) ||
+                             item.match(/<title>(.*?)<\/title>/s);
+          const linkMatch  = item.match(/<link>(.*?)<\/link>/s);
+          const dateMatch  = item.match(/<pubDate>(.*?)<\/pubDate>/s);
+          const guidMatch  = item.match(/<guid[^>]*>(.*?)<\/guid>/s);
+
+          const text = (titleMatch?.[1] || '')
+            .replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').trim();
+          // Skip retweets and reply markers
+          if (!text || text.startsWith('RT by') || text.startsWith('R to ')) continue;
+
+          items.push({
+            id: 'tw_' + (guidMatch?.[1] || linkMatch?.[1] || '').split('/').pop(),
+            platform: 'twitter',
+            text: text.substring(0, 500),
+            url: linkMatch?.[1] || '',
+            posted_at: dateMatch?.[1] ? new Date(dateMatch[1]).getTime() : Date.now(),
+          });
+        }
+        return items;
+      } catch(e) { /* try next instance */ }
+    }
+    return [];
+  } catch(e) {
+    console.error('Twitter poll error:', e.message);
+    return [];
+  }
+}
+
+// ── 3. AI SENTIMENT ANALYSIS (Claude API) ───────────────────
+async function analyzeTrumpPostForGold(text) {
+  if (!ANTHROPIC_API_KEY) {
+    // Fallback: keyword-based simple sentiment
+    return simpleSentimentFallback(text);
+  }
+
+  try {
+    const prompt = `You are a gold-market analyst. Analyze this post by Donald Trump and predict its IMMEDIATE impact on XAU/USD (Gold) price within the next 30-60 minutes.
+
+POST: "${text}"
+
+Consider:
+- Iran/Middle East mentions → BULLISH gold (safe haven)
+- Iran de-escalation/peace → BEARISH gold (risk-on)
+- Tariffs/trade war → BULLISH gold (uncertainty)
+- Fed criticism / rate cut pressure → BULLISH gold (weak dollar)
+- Dollar strength comments → BEARISH gold
+- Nothing market-relevant → NEUTRAL
+
+Respond in STRICT JSON format ONLY (no other text):
+{"impact":"HIGH|MEDIUM|LOW|NONE","direction":"BULLISH|BEARISH|NEUTRAL","confidence":0.0-1.0,"reason":"max 80 chars","expected_move_pct":0.0-3.0}
+
+If post is unrelated to gold/dollar/economy/geopolitics → return impact:"NONE"`;
+
+    const r = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }]
+    }, {
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      timeout: 15000
+    });
+
+    const responseText = r.data?.content?.[0]?.text || '';
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON in Claude response');
+
+    const result = JSON.parse(jsonMatch[0]);
+    return {
+      impact: result.impact || 'NONE',
+      direction: result.direction || 'NEUTRAL',
+      confidence: Math.max(0, Math.min(1, parseFloat(result.confidence) || 0)),
+      reason: (result.reason || '').substring(0, 100),
+      expected_move_pct: Math.max(0, Math.min(5, parseFloat(result.expected_move_pct) || 0))
+    };
+  } catch(e) {
+    console.error('Claude sentiment error:', e.response?.data?.error?.message || e.message);
+    return simpleSentimentFallback(text);
+  }
+}
+
+// Fallback when Claude API fails or no key
+function simpleSentimentFallback(text) {
+  const lower = text.toLowerCase();
+  let direction = 'NEUTRAL';
+  let impact = 'NONE';
+  const reasons = [];
+
+  // Bullish triggers
+  const bullish = ['iran', 'tariff', 'trade war', 'fed cut', 'dollar weak', 'china war', 'sanctions', 'inflation'];
+  // Bearish triggers
+  const bearish = ['peace', 'ceasefire', 'deal', 'agreement', 'rate hike', 'strong dollar', 'de-escalat'];
+
+  for (const kw of bullish) if (lower.includes(kw)) { direction = 'BULLISH'; reasons.push(kw); }
+  for (const kw of bearish) if (lower.includes(kw)) { direction = 'BEARISH'; reasons.push(kw); }
+
+  if (reasons.length >= 2) impact = 'HIGH';
+  else if (reasons.length === 1) impact = 'MEDIUM';
+  else impact = 'NONE';
+
+  return {
+    impact, direction,
+    confidence: reasons.length ? 0.6 : 0.3,
+    reason: reasons.length ? `Keywords: ${reasons.slice(0,3).join(', ')}` : 'No relevant keywords',
+    expected_move_pct: impact === 'HIGH' ? 1.0 : impact === 'MEDIUM' ? 0.5 : 0
+  };
+}
+
+// ── 4. SEND TRUMP ALERT to Telegram + Push ──────────────────
+async function sendTrumpAlert(post, analysis) {
+  // Skip NEUTRAL/NONE impact (avoid spam)
+  if (analysis.impact === 'NONE' || analysis.impact === 'LOW') {
+    console.log(`📵 Trump alert skipped (impact ${analysis.impact}): "${post.text.substring(0,60)}..."`);
+    return;
+  }
+
+  const arrow = analysis.direction === 'BULLISH' ? '🟢⬆️' :
+                analysis.direction === 'BEARISH' ? '🔴⬇️' : '⚪';
+  const platformIcon = post.platform === 'truth_social' ? '📢' : '🐦';
+  const impactEmoji = analysis.impact === 'HIGH' ? '🚨' : '⚠️';
+  const confPct = Math.round(analysis.confidence * 100);
+
+  // Telegram message
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHANNEL_ID) {
+    try {
+      const tgMsg = [
+        `${impactEmoji} <b>TRUMP ALERT — Gold Impact</b>`,
+        ``,
+        `${platformIcon} <i>${post.platform === 'truth_social' ? 'Truth Social' : 'X/Twitter'} · just now</i>`,
+        ``,
+        `${arrow} <b>${analysis.direction} for Gold</b>`,
+        `<b>Impact:</b> ${analysis.impact} · <b>Confidence:</b> ${confPct}%`,
+        `<b>Expected move:</b> ${analysis.expected_move_pct > 0 ? '~' + analysis.expected_move_pct.toFixed(1) + '%' : 'unclear'}`,
+        ``,
+        `💬 <b>Why:</b> ${analysis.reason}`,
+        ``,
+        `<blockquote>${post.text.substring(0, 300)}${post.text.length > 300 ? '...' : ''}</blockquote>`,
+        ``,
+        post.url ? `<a href="${post.url}">View original post →</a>` : '',
+        ``,
+        `📱 <i>Get real-time alerts in the Pulstrade App</i>`,
+        `<a href="https://apps.apple.com/de/app/pulstrade/id6762018999">Open App →</a>`,
+      ].filter(Boolean).join('\n');
+
+      await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          chat_id: TELEGRAM_CHANNEL_ID,
+          text: tgMsg,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true
+        },
+        { timeout: 10000 }
+      );
+      console.log(`✅ Trump alert sent to Telegram: ${analysis.direction} (${analysis.impact})`);
+    } catch(e) {
+      console.error('Trump→Telegram error:', e.response?.data?.description || e.message);
+    }
+  }
+
+  // Push notification to App users
+  try {
+    const pushTitle = `${impactEmoji} TRUMP ALERT · Gold ${analysis.direction}`;
+    const pushBody  = `${analysis.reason} · ${confPct}% confidence`;
+    admin.messaging().send({
+      topic: 'all_users',
+      notification: { title: pushTitle, body: pushBody },
+      data: {
+        type: 'trump_alert',
+        platform: post.platform,
+        direction: analysis.direction,
+        impact: analysis.impact,
+        url: post.url || '',
+      },
+      android: { priority: 'high' },
+      apns: { headers: { 'apns-priority': '10' } }
+    }).then(() => console.log(`✅ Trump alert push sent`))
+      .catch(e => console.error('Trump push:', e.message));
+  } catch(e) { console.error('Push setup:', e.message); }
+
+  // Mark as notified in DB
+  try {
+    db.prepare(`UPDATE trump_events SET notified = 1 WHERE id = ?`).run(post.id);
+  } catch(e) {}
+}
+
+// ── 5. MAIN POLL LOOP ───────────────────────────────────────
+async function pollTrumpAndAnalyze() {
+  if (!TRUMP_ENABLED) return;
+  try {
+    // Poll both platforms in parallel
+    const [tsP, twP] = await Promise.all([pollTruthSocial(), pollTwitter()]);
+    const allPosts = [...tsP, ...twP].sort((a, b) => a.posted_at - b.posted_at);
+
+    // Process only NEW posts (not seen before)
+    const newPosts = allPosts.filter(p => p.id && !seenTrumpPosts.has(p.id));
+
+    if (newPosts.length === 0) return;
+    console.log(`🔍 Trump Monitor: ${newPosts.length} new post(s) detected`);
+
+    for (const post of newPosts) {
+      seenTrumpPosts.add(post.id);
+
+      // Skip very old posts (>30 min) — likely backfill on first boot
+      if (post.posted_at < Date.now() - 30*60*1000) {
+        console.log(`⏭️  Trump post too old (${Math.round((Date.now()-post.posted_at)/60000)} min ago), skipping`);
+        try {
+          db.prepare(`INSERT OR IGNORE INTO trump_events
+            (id, platform, text, url, posted_at, detected_at, impact)
+            VALUES (?, ?, ?, ?, ?, ?, 'OLD')`)
+            .run(post.id, post.platform, post.text, post.url, post.posted_at, Date.now());
+        } catch(e) {}
+        continue;
+      }
+
+      // Analyze with AI
+      const analysis = await analyzeTrumpPostForGold(post.text);
+
+      // Save to DB
+      try {
+        db.prepare(`INSERT OR IGNORE INTO trump_events
+          (id, platform, text, url, posted_at, detected_at, impact, direction, confidence, reason, expected_move)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(
+            post.id, post.platform, post.text, post.url,
+            post.posted_at, Date.now(),
+            analysis.impact, analysis.direction, analysis.confidence,
+            analysis.reason, analysis.expected_move_pct
+          );
+      } catch(e) { console.error('Trump DB insert:', e.message); }
+
+      console.log(`📊 Trump (${post.platform}): "${post.text.substring(0,80)}..." → ${analysis.direction} ${analysis.impact} ${Math.round(analysis.confidence*100)}%`);
+
+      // Send alert if HIGH/MEDIUM impact
+      await sendTrumpAlert(post, analysis);
+
+      // Small delay between posts to avoid rate-limits
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  } catch(e) {
+    console.error('Trump monitor error:', e.message);
+  }
+}
+
+// Boot trump monitor
+if (TRUMP_ENABLED) {
+  console.log(`🐘 Trump Monitor: ENABLED (poll every ${TRUMP_POLL_INTERVAL/1000}s)`);
+  console.log(`   - Truth Social: @${TRUTHSOCIAL_USER}`);
+  console.log(`   - Twitter/X:    @${TWITTER_USERNAME}`);
+  console.log(`   - AI Analysis:  ${ANTHROPIC_API_KEY ? 'Claude API ✓' : 'Keyword fallback'}`);
+  // First poll after 30s to let DB settle
+  setTimeout(pollTrumpAndAnalyze, 30000);
+  setInterval(pollTrumpAndAnalyze, TRUMP_POLL_INTERVAL);
+} else {
+  console.log(`🐘 Trump Monitor: DISABLED (set TRUMP_MONITOR_ENABLED=true to enable)`);
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -1906,10 +2282,10 @@ trackSignalOutcomes();
 setInterval(trackSignalOutcomes, 15 * 60 * 1000);
 
 // ── Routes ─────────────────────────────────────────────────
-app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.5.0-telegram' }));
+app.get('/', (req,res) => res.json({ status:'Pulstrade Backend', version:'5.6.0-trump-monitor' }));
 app.get('/health', (req,res) => res.json({
   status:'ok',
-  version: '5.5.0-telegram',
+  version: '5.6.0-trump-monitor',
   dbPath: DB_PATH,
   dbPersistent: dbInfo.persistent,
   dbDir: DB_DIR,
@@ -2304,6 +2680,47 @@ app.get('/test-telegram', async (req, res) => {
   };
   const result = await sendTelegramSignal(testSignal);
   res.json({ success: result?.success !== false, ...result, sentAs: testSignal });
+});
+
+// ── TEST TRUMP ALERT — manually trigger Trump analysis ─────
+app.get('/test-trump', async (req, res) => {
+  const testText = req.query.text || "Iran refuses to negotiate. We will impose massive new tariffs on China starting Monday. The Fed must cut rates immediately to support our great economy!";
+  try {
+    const analysis = await analyzeTrumpPostForGold(testText);
+    const mockPost = {
+      id: 'test_' + Date.now(),
+      platform: 'truth_social',
+      text: testText,
+      url: '',
+      posted_at: Date.now()
+    };
+    if (req.query.send === '1') {
+      await sendTrumpAlert(mockPost, analysis);
+    }
+    res.json({ analyzed: testText, analysis, sent: req.query.send === '1' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── TRUMP EVENTS HISTORY ───────────────────────────────────
+app.get('/trump-events', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit || '50', 10);
+    const events = db.prepare(`SELECT * FROM trump_events
+      ORDER BY detected_at DESC LIMIT ?`).all(Math.min(limit, 200));
+    const stats = {
+      total: db.prepare(`SELECT COUNT(*) as c FROM trump_events`).get().c,
+      high_impact: db.prepare(`SELECT COUNT(*) as c FROM trump_events WHERE impact='HIGH'`).get().c,
+      medium_impact: db.prepare(`SELECT COUNT(*) as c FROM trump_events WHERE impact='MEDIUM'`).get().c,
+      bullish: db.prepare(`SELECT COUNT(*) as c FROM trump_events WHERE direction='BULLISH'`).get().c,
+      bearish: db.prepare(`SELECT COUNT(*) as c FROM trump_events WHERE direction='BEARISH'`).get().c,
+      notified: db.prepare(`SELECT COUNT(*) as c FROM trump_events WHERE notified=1`).get().c,
+    };
+    res.json({ stats, events });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── FORCE SCAN — manually trigger scanner ──────────────────
