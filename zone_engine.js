@@ -246,7 +246,8 @@ async function buildZonesForSession(sessionKey) {
           ? Math.abs(c.high - lv.price) <= atr * TOUCH_TOL_ATR
           : Math.abs(c.low - lv.price) <= atr * TOUCH_TOL_ATR
       ).length;
-      if (touches >= 2) { score += 25; reasons.push(`${touches} touches`); }
+      if (touches >= 5) { score += 30; reasons.push(`${touches} touches`); }
+      else if (touches >= 2) { score += 25; reasons.push(`${touches} touches`); }
       else if (touches === 1) { score += 10; reasons.push('1 touch'); }
 
       // MTF confluence: H1 swing agreeing with an M15 pivot/level
@@ -255,6 +256,9 @@ async function buildZonesForSession(sessionKey) {
       } else if (lv.sources.has('h1_swing') || lv.sources.has('prev_day') || lv.sources.has('asia_range')) {
         score += 12; reasons.push([...lv.sources][0]);
       }
+
+      // Multi-source confluence (2+ independent level sources agree)
+      if (lv.sources.size >= 2) { score += 8; reasons.push(`${lv.sources.size} sources`); }
 
       // Round level in zone
       if (lv.sources.has('round') || Math.abs(lv.price - nearestRound(lv.price)) <= SNAP_TOL) {
@@ -267,7 +271,7 @@ async function buildZonesForSession(sessionKey) {
       }
 
       // Reachable-but-not-immediate distance band sweet spot
-      if (dist >= atr * 0.8 && dist <= atr * 2.0) { score += 10; reasons.push('clean distance'); }
+      if (dist >= atr * 0.8 && dist <= atr * 2.8) { score += 10; reasons.push('clean distance'); }
 
       console.log(`  🔬 [${sessionKey}] ${action} ${lv.price.toFixed(1)} → ${score}pts (${reasons.join(', ') || 'no factors'}) dist ${(dist/atr).toFixed(1)}ATR`);
       if (score < MIN_CONFIDENCE) continue;
