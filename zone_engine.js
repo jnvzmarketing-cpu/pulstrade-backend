@@ -22,6 +22,8 @@ const MIN_DIST_ATR     = 0.5;      // level must be ≥ 0.5*ATR from price
 const MAX_DIST_ATR     = 3.5;  // widened (was 2.5)      // …and ≤ 2.5*ATR (reachable this session)
 const TOUCH_TOL_ATR    = 0.3;      // counts as a "touch" of a level
 const SNAP_TOL         = 2.0;      // snap TPs to round numbers within ±$2
+const GRID             = 0.5;      // all levels on 0.50 grid — identical on MT5/TradingView
+const PIERCE_TOL       = 0.2;      // fills/TPs only count when pierced by $0.20 (spread guard)
 
 // Sessions in UTC: [label, openHour, closeHour, zoneGenHour, zoneGenMin]
 const SESSIONS = [
@@ -58,6 +60,9 @@ function rsi14(closes) {
   return Math.round((100 - 100 / (1 + (g / 14) / ((l / 14) || 0.001))) * 10) / 10;
 }
 const round2 = (v) => Math.round(v * 100) / 100;
+const grid = (v) => Math.round(v / GRID) * GRID;                       // nearest 0.50
+const gridOut = (v, dir) => (dir > 0 ? Math.ceil(v / GRID) : Math.floor(v / GRID)) * GRID; // away from entries
+const gridIn  = (v, dir) => (dir > 0 ? Math.floor(v / GRID) : Math.ceil(v / GRID)) * GRID; // conservative (never further than computed)
 const nearestRound = (v, step = 10) => Math.round(v / step) * step;
 function snapToRound(price, isSellTp) {
   const r = nearestRound(price);
@@ -301,9 +306,10 @@ async function insertZone(z, sessionKey, atr, m15, h1Pivots) {
   const sell = z.action === 'SELL';
   const dir = sell ? 1 : -1;
 
-  const entry1 = round2(z.level);
-  const entry2 = round2(z.level + dir * ENTRY2_ATR * atr);
-  let sl = entry2 + dir * SL_BUFFER_ATR * atr;
+  const entry1 = grid(z.level);
+  let entry2 = grid(z.level + dir * ENTRY2_ATR * atr);
+  if (entry2 === entry1) entry2 = entry1 + dir * GRID; // never identical
+  let sl = gridOut(entry2 + dir * SL_BUFFER_ATR * atr, dir); // outward on grid — never tighter
   // SL snapped OUTWARD to the next round number if close (never tighter)
   const slRound = nearestRound(sl);
   if (sell && slRound > sl && slRound - sl <= SNAP_TOL) sl = slRound;
@@ -332,7 +338,7 @@ async function insertZone(z, sessionKey, atr, m15, h1Pivots) {
     nextSwing ?? (entry1 - dir * 1.6 * atr),  // TP3 swing
     avgEntry - dir * 1.5 * risk,              // TP4 measured move 1.5R
     htfLevels ?? (entry1 - dir * 3.0 * atr),  // TP5 HTF level
-  ].map(p => snapToRound(p, sell));
+  ].map(p => sell ? Math.ceil(p / GRID) * GRID : Math.floor(p / GRID) * GRID); // conservative: TP never further than computed
 
   // sort by distance, dedupe (< 0.3*ATR apart)
   raw = raw
@@ -415,7 +421,7 @@ async function watchZones() {
       // 1) Entry fills (limit logic: SELL fills when price trades AT/ABOVE entry)
       for (const e of zone.entries) {
         if (e.status !== 'pending') continue;
-        const filled = sell ? hi >= e.price : lo <= e.price;
+        const filled = sell ? hi >= e.price + PIERCE_TOL : lo <= e.price - PIERCE_TOL;
         if (filled) {
           e.status = 'filled'; e.filled_at = new Date().toISOString();
           zone.status = 'filled';
@@ -434,7 +440,7 @@ async function watchZones() {
         // 3) TP hits (only count TPs beyond what price actually reached)
         for (const tp of zone.tps) {
           if (tp.status === 'hit') continue;
-          const hit = sell ? lo <= tp.price : hi >= tp.price;
+          const hit = sell ? lo <= tp.price - PIERCE_TOL : hi >= tp.price + PIERCE_TOL;
           if (hit && !(slHit && tp.level >= 3)) { // pessimistic: deep TPs don't count if SL also swept
             tp.status = 'hit'; tp.hit_at = new Date().toISOString();
             changed = true;
