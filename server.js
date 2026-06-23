@@ -66,7 +66,7 @@ function sendSignalPush(signal) {
         aps: { 
           sound: 'default', 
           badge: 1,
-          'mutable-content': 1,
+          //'mutable-content': 1,
           alert: subtitle ? { title, subtitle, body } : { title, body },
         } 
       }, 
